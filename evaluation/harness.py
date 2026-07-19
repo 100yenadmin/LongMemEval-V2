@@ -333,6 +333,19 @@ def supports_nonshared_parallel_prompt_build(memory_type: str) -> bool:
     return memory_type in NONSHARED_PARALLEL_MEMORY_TYPES
 
 
+def memory_config_enables_online_learning(memory_config: dict[str, Any] | None) -> bool:
+    if memory_config is None or memory_config.get("memory_type") != "agentrunbook_c_v2":
+        return False
+    memory_params = memory_config.get("memory_params")
+    if not isinstance(memory_params, dict):
+        return False
+    online_learning_params = memory_params.get("online_learning_params")
+    return (
+        isinstance(online_learning_params, dict)
+        and online_learning_params.get("enabled") is True
+    )
+
+
 def get_memory_context_processor() -> Any:
     from transformers import AutoProcessor
 
@@ -1060,6 +1073,18 @@ def main() -> None:
     memory_config_template: dict[str, Any] | None = None
     if args.memory_config_path is not None:
         memory_config_template = load_memory_config(args.memory_config_path)
+    parallel_guard_memory_config = memory_config_template
+    if parallel_guard_memory_config is None and args.load_memory_dir is not None:
+        parallel_guard_memory_config = load_memory_config(
+            Path(args.load_memory_dir) / "memory_config.json"
+        )
+    require(
+        not (
+            args.prompt_build_max_workers > 1
+            and memory_config_enables_online_learning(parallel_guard_memory_config)
+        ),
+        "--prompt-build-max-workers > 1 is not supported when online learning is enabled",
+    )
     if args.load_memory_dir is None:
         if memory_config_template["memory_type"] in {
             "rag",

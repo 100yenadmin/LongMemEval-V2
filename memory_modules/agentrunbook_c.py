@@ -338,7 +338,10 @@ class AgentRunbookC(CodexMemory):
         if events:
             save_json(events_path, events)
 
-        status = read_memory_output_status(output_path)
+        status = read_memory_output_status(
+            output_path,
+            require_evidence_gate=self.require_evidence_gate,
+        )
         raw_output_text = output_path.read_text(encoding="utf-8") if output_path.exists() else None
         summary: dict[str, Any] = {
             "question_id": question_id,
@@ -395,15 +398,22 @@ class AgentRunbookC(CodexMemory):
                 "memory_context": [],
             }
 
-        summary.update(
-            {
-                "memory_markdown": normalized_output["memory_markdown"],
-                "trajectory_spans_raw": normalized_output["trajectory_spans_raw"],
-                "trajectory_spans_valid": normalized_output["trajectory_spans_valid"],
-                "trajectory_spans_invalid": normalized_output["trajectory_spans_invalid"],
-                "memory_context_item_count": len(memory_context),
-            }
-        )
+        summary_fields = {
+            "memory_markdown": normalized_output["memory_markdown"],
+            "trajectory_spans_raw": normalized_output["trajectory_spans_raw"],
+            "trajectory_spans_valid": normalized_output["trajectory_spans_valid"],
+            "trajectory_spans_invalid": normalized_output["trajectory_spans_invalid"],
+            "memory_context_item_count": len(memory_context),
+        }
+        if "evidence_status" in normalized_output:
+            summary_fields.update(
+                {
+                    "evidence_status": normalized_output["evidence_status"],
+                    "evidence_status_reason": normalized_output["evidence_status_reason"],
+                    "answer_policy": normalized_output["answer_policy"],
+                }
+            )
+        summary.update(summary_fields)
         save_json(summary_path, summary)
         return {
             "success": True,

@@ -15,6 +15,12 @@ from .codex import (
     utc_now_iso,
 )
 from .memory import MemoryConfig, register_memory, require
+from .agentrunbook_online_learning import (
+    AgentRunbookOnlineLearning,
+    AgentRunbookOnlineLearningCodexConfig,
+    AgentRunbookOnlineLearningCodexRunner,
+    AgentRunbookOnlineLearningConfig,
+)
 from .oai_agents_sdk import (
     OaiAgentsSDKRunner,
     OaiAgentsSDKRunnerConfig,
@@ -25,11 +31,71 @@ from .oai_agents_sdk import (
 )
 
 
+QUERY_INSTRUCTION_APPENDIX = """
+
+## Learned Retrieval Strategy
+
+If `LEARNED_RETRIEVAL_STRATEGY.md` exists, use it as private retrieval
+guidance. It may contain notes learned from previous queries across task types.
+You may read it before broad trajectory exploration and revisit it after
+inspecting the current working directory to find the most relevant note. Do not
+edit the strategy file.
+
+Each learned row's `Evidence status` describes how the previous task's cited
+evidence fit the previous task. It is provenance for that old note, not the
+evidence status for the current question, and not proof that the note should be
+used now.
+
+Use relevant learned rows as candidate search leads:
+
+- `directly_supported` means the previous task had exact positive support. For
+  the current question, use it only after current cited evidence is non-empty,
+  directly proves the requested target, matches the exact entity / actor-view /
+  page / section / field-control / workflow stage / pre-post state, and resolves
+  any UI-count, label-mapping, section-boundary, or before-after ambiguity.
+- `contradicts_premise` means the previous task had exact contradictory or
+  closed-set absence evidence. For the current question, use it only after the
+  current scoped span directly shows the named field, control, workflow, page, or
+  premise is absent or wrong. If a current closed set of options, fields, tabs,
+  buttons, or related records is visible and the requested target is absent,
+  surface that absence clearly.
+- `near_match_only` means the previous task found only a similar workflow, page,
+  actor/view, entity, field, section, time, or state. Use it only as navigation
+  or contrast; it is not answer evidence for the current question.
+- `insufficient` means the previous task lacked exact support or contradiction.
+  Use it only as a warning about missing evidence or a repeatable search trap;
+  still continue current-task exploration.
+
+Do not treat learned notes as absolute truth. Still inspect the current working
+directory and current trajectory evidence to decide whether any note is helpful
+for this question.
+
+This appendix does not change the output JSON schema. `memory_markdown` and
+`trajectory_spans` are the final filtered memory context:
+
+- Include only current verified evidence and concise reasoning that should be
+  used for the current question. If a learned note guided the search, mention it
+  only when useful and only after current cited evidence verifies the point.
+- Omit rejected notes.
+- Usually omit `near_match_only` notes and spans; include them only when useful
+  as clearly labeled reference or contrast.
+- For `contradicts_premise`, clearly state the false premise and cite the exact
+  scoped absence or contradiction. If a closed set proves the requested target is
+  absent, describe that absence directly instead of treating the evidence as
+  missing.
+- Never pass along answer-like text from a learned note unless current cited
+  evidence independently verifies it.
+"""
+
+
 @register_memory
 class AgentRunbookCV2(AgentRunbookC):
     memory_type = "agentrunbook_c_v2"
 
     def __init__(self, memory_params: dict[str, object]) -> None:
+        online_learning_config = AgentRunbookOnlineLearningConfig.from_params(
+            memory_params.get("online_learning_params")
+        )
         sdk_params_obj = memory_params.get(
             "query_openai_sdk_params",
             memory_params.get("query_codex_params", memory_params.get("codex_params", {})),
@@ -63,6 +129,7 @@ class AgentRunbookCV2(AgentRunbookC):
             "timeout_seconds": timeout_seconds,
             "max_retries": max_attempts,
             "prompt": sdk_params.get("prompt", memory_params.get("prompt", "")) or None,
+            "require_evidence_gate": False,
             "extra_config": [],
             "extra_args": [],
         }
@@ -70,6 +137,24 @@ class AgentRunbookCV2(AgentRunbookC):
             base_params["query_codex_params"].pop("prompt")
 
         super().__init__(base_params)
+        self.online_learning = AgentRunbookOnlineLearning(online_learning_config)
+        if self.online_learning.enabled:
+            strategy_prompt_suffix = (
+                "Also read LEARNED_RETRIEVAL_STRATEGY.md for reusable retrieval leads; verify exact current evidence before treating any note as support."
+            )
+            if strategy_prompt_suffix not in self.codex_prompt:
+                self.codex_prompt = f"{self.codex_prompt.rstrip()} {strategy_prompt_suffix}"
+            step_one_marker = "\n## Step 1: do a quick triage of the query so that you have an expectation of what to do."
+            if step_one_marker in self.query_instruction_text:
+                self.query_instruction_text = self.query_instruction_text.replace(
+                    step_one_marker,
+                    QUERY_INSTRUCTION_APPENDIX + step_one_marker,
+                    1,
+                )
+            else:
+                self.query_instruction_text = (
+                    self.query_instruction_text.rstrip() + QUERY_INSTRUCTION_APPENDIX
+                )
 
         self.sdk_model = model
         self.sdk_reasoning_effort = reasoning_effort
@@ -120,6 +205,18 @@ class AgentRunbookCV2(AgentRunbookC):
             sdk_params.get("api_max_retries", 0),
             field_name="query_openai_sdk_params.api_max_retries",
         )
+        self.consolidation_codex_runner = (
+            AgentRunbookOnlineLearningCodexRunner(
+                AgentRunbookOnlineLearningCodexConfig(
+                    binary=self.online_learning.config.consolidation_codex_binary,
+                    model=self.sdk_model,
+                    reasoning_effort=self.sdk_reasoning_effort,
+                    timeout_seconds=self.online_learning.config.timeout_seconds,
+                )
+            )
+            if self.online_learning.enabled
+            else None
+        )
         self.sdk_runner = OaiAgentsSDKRunner(
             OaiAgentsSDKRunnerConfig(
                 model=self.sdk_model,
@@ -164,6 +261,8 @@ class AgentRunbookCV2(AgentRunbookC):
         }
         if self.trajectory_pool_root is not None:
             memory_params["trajectory_pool_root"] = str(self.trajectory_pool_root)
+        if self.online_learning.enabled:
+            memory_params["online_learning_params"] = self.online_learning.config.to_params()
         return {
             "memory_type": self.memory_type,
             "memory_params": memory_params,
@@ -183,7 +282,17 @@ class AgentRunbookCV2(AgentRunbookC):
             "api_write_timeout_seconds": self.api_write_timeout_seconds,
             "api_pool_timeout_seconds": self.api_pool_timeout_seconds,
             "api_max_retries": self.api_max_retries,
+            "online_learning_enabled": self.online_learning.enabled,
         }
+
+    def _populate_sandbox_scripts(self, sandbox_dir: Path) -> list[str]:
+        scripts = super()._populate_sandbox_scripts(sandbox_dir)
+        self.online_learning.expose_to_sandbox(
+            sandbox_dir=sandbox_dir,
+            query_trace_dir=self.query_trace_dir,
+            workspace_dir=self.workspace_dir,
+        )
+        return scripts
 
     def _estimate_sdk_token_throughput(
         self,
@@ -320,6 +429,11 @@ class AgentRunbookCV2(AgentRunbookC):
         (sandbox_dir / "INSTRUCTION.md").write_text(self.query_instruction_text, encoding="utf-8")
         summary_result = self._ensure_trajectory_summary(attempt_dir=attempt_dir)
         if not summary_result["success"]:
+            self.online_learning.expose_to_sandbox(
+                sandbox_dir=sandbox_dir,
+                query_trace_dir=self.query_trace_dir,
+                workspace_dir=self.workspace_dir,
+            )
             summary: dict[str, Any] = {
                 "question_id": question_id,
                 "attempt_index": attempt_index,
@@ -341,12 +455,18 @@ class AgentRunbookCV2(AgentRunbookC):
                 "status_after_detail": summary_result["detail"],
             }
             save_json(attempt_dir / "summary.json", summary)
-            return {
+            attempt_result = {
                 "success": False,
                 "status": summary_result["status"],
                 "detail": summary_result["detail"],
                 "memory_context": [],
             }
+            self.online_learning.finalize_attempt(
+                query_trace_dir=self.query_trace_dir,
+                question_id=question_id,
+                attempt_result=attempt_result,
+            )
+            return attempt_result
 
         relative_symlink(self.workspace_dir / "trajectories", sandbox_dir / "trajectories")
         sandbox_helper_scripts = self._populate_sandbox_scripts(sandbox_dir)
@@ -365,7 +485,10 @@ class AgentRunbookCV2(AgentRunbookC):
             last_message_path=last_message_path,
             events_path=events_path,
         )
-        status = read_memory_output_status(output_path)
+        status = read_memory_output_status(
+            output_path,
+            require_evidence_gate=self.require_evidence_gate,
+        )
         raw_output_text = output_path.read_text(encoding="utf-8") if output_path.exists() else None
         status_after = execution_result["status_after"] or status.state
         status_detail = execution_result["status_after_detail"]
@@ -406,20 +529,32 @@ class AgentRunbookCV2(AgentRunbookC):
 
         if execution_result["fatal_error"] and not status.is_finished:
             save_json(summary_path, summary)
-            return {
+            attempt_result = {
                 "success": False,
                 "status": status_after,
                 "detail": status_detail,
                 "memory_context": [],
             }
+            self.online_learning.finalize_attempt(
+                query_trace_dir=self.query_trace_dir,
+                question_id=question_id,
+                attempt_result=attempt_result,
+            )
+            return attempt_result
         if not status.is_finished:
             save_json(summary_path, summary)
-            return {
+            attempt_result = {
                 "success": False,
                 "status": status.state,
                 "detail": status.detail,
                 "memory_context": [],
             }
+            self.online_learning.finalize_attempt(
+                query_trace_dir=self.query_trace_dir,
+                question_id=question_id,
+                attempt_result=attempt_result,
+            )
+            return attempt_result
 
         try:
             normalized_output = self._normalize_output_for_query(output_path)
@@ -428,26 +563,135 @@ class AgentRunbookCV2(AgentRunbookC):
             summary["status_after"] = "internal_postprocess_error"
             summary["status_after_detail"] = str(exc)
             save_json(summary_path, summary)
-            return {
+            attempt_result = {
                 "success": False,
                 "status": "internal_postprocess_error",
                 "detail": str(exc),
                 "memory_context": [],
             }
+            self.online_learning.finalize_attempt(
+                query_trace_dir=self.query_trace_dir,
+                question_id=question_id,
+                attempt_result=attempt_result,
+            )
+            return attempt_result
 
-        summary.update(
-            {
-                "memory_markdown": normalized_output["memory_markdown"],
-                "trajectory_spans_raw": normalized_output["trajectory_spans_raw"],
-                "trajectory_spans_valid": normalized_output["trajectory_spans_valid"],
-                "trajectory_spans_invalid": normalized_output["trajectory_spans_invalid"],
-                "memory_context_item_count": len(memory_context),
-            }
-        )
+        summary_fields = {
+            "memory_markdown": normalized_output["memory_markdown"],
+            "trajectory_spans_raw": normalized_output["trajectory_spans_raw"],
+            "trajectory_spans_valid": normalized_output["trajectory_spans_valid"],
+            "trajectory_spans_invalid": normalized_output["trajectory_spans_invalid"],
+            "memory_context_item_count": len(memory_context),
+        }
+        if "evidence_status" in normalized_output:
+            summary_fields.update(
+                {
+                    "evidence_status": normalized_output["evidence_status"],
+                    "evidence_status_reason": normalized_output["evidence_status_reason"],
+                    "answer_policy": normalized_output["answer_policy"],
+                }
+            )
+        summary.update(summary_fields)
         save_json(summary_path, summary)
-        return {
+        attempt_result = {
             "success": True,
             "status": status.state,
             "detail": status.detail,
             "memory_context": memory_context,
         }
+        self.online_learning.finalize_attempt(
+            query_trace_dir=self.query_trace_dir,
+            question_id=question_id,
+            attempt_result=attempt_result,
+        )
+        return attempt_result
+
+    def post_query_hook(
+        self,
+        *,
+        query: str,
+        query_image: str | None,
+        memory_context: list[dict[str, str]],
+    ) -> dict[str, object] | None:
+        if not self.online_learning.enabled:
+            return None
+        query_context = self.get_query_context()
+        question_id_value = query_context.get("question_id")
+        if isinstance(question_id_value, str) and question_id_value.strip():
+            question_id = question_id_value
+        else:
+            question_id = self.question_id_by_text.get(query)
+        if not isinstance(question_id, str) or not question_id:
+            return {
+                "status": "skipped",
+                "reason": "unknown_question_id",
+            }
+
+        attempt_dir = self.online_learning.attempt_for_post_query(
+            query_trace_dir=self.query_trace_dir,
+            question_id=question_id,
+        )
+        if attempt_dir is None:
+            return {
+                "status": "skipped",
+                "reason": "missing_attempt_dir",
+                "question_id": question_id,
+            }
+
+        summary_path = attempt_dir / "summary.json"
+        if not summary_path.exists():
+            return {
+                "status": "skipped",
+                "reason": "missing_attempt_summary",
+                "question_id": question_id,
+                "attempt_dir": str(attempt_dir),
+            }
+        try:
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {
+                "status": "skipped",
+                "reason": "invalid_attempt_summary",
+                "question_id": question_id,
+                "attempt_dir": str(attempt_dir),
+                "detail": str(exc),
+            }
+        if not isinstance(summary_payload, dict) or summary_payload.get("status_after") != "finished":
+            return {
+                "status": "skipped",
+                "reason": "query_not_finished",
+                "question_id": question_id,
+                "attempt_dir": str(attempt_dir),
+                "status_after": (
+                    summary_payload.get("status_after")
+                    if isinstance(summary_payload, dict)
+                    else None
+                ),
+            }
+
+        require(
+            self.consolidation_codex_runner is not None,
+            "online-learning consolidation runner is not configured",
+        )
+        return self.online_learning.run_consolidation(
+            question_id=question_id,
+            attempt_dir=attempt_dir,
+            query_trace_dir=self.query_trace_dir,
+            workspace_dir=self.workspace_dir,
+            consolidation_runner=self.consolidation_codex_runner,
+            is_cancelled=self._is_cancelled,
+        )
+
+    def _save_backend(self, output_dir: Path) -> None:
+        super()._save_backend(output_dir)
+        self.online_learning.copy_strategy_to(
+            output_dir=output_dir,
+            query_trace_dir=self.query_trace_dir,
+            workspace_dir=self.workspace_dir,
+        )
+        return None
+
+    def _load_backend(self, input_dir: Path) -> None:
+        super()._load_backend(input_dir)
+        self.online_learning.bind_loaded_strategy_memory_dir(input_dir / "strategy_memory")
+        return None

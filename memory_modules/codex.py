@@ -20,6 +20,21 @@ from .trajectory_store import (
 
 
 MAX_TOTAL_SPAN_STATES = 20
+VALID_EVIDENCE_STATUSES = frozenset(
+    {
+        "directly_supported",
+        "contradicts_premise",
+        "near_match_only",
+        "insufficient",
+    }
+)
+ANSWER_POLICY_BY_EVIDENCE_STATUS = {
+    "directly_supported": "answer_normally",
+    "contradicts_premise": "state_premise_false",
+    "near_match_only": "say_exact_target_not_found",
+    "insufficient": "abstain_unknown",
+}
+VALID_ANSWER_POLICIES = frozenset(ANSWER_POLICY_BY_EVIDENCE_STATUS.values())
 DEFAULT_CODEX_BINARY = Path(os.getenv("CODEX_BINARY", "codex"))
 DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
@@ -181,10 +196,50 @@ def copy_question_image(question_image_path: str, sandbox_dir: Path) -> str:
     return image_name
 
 
-def validate_memory_module_output_payload(payload: Any) -> dict[str, Any]:
+def validate_memory_module_output_payload(
+    payload: Any,
+    *,
+    require_evidence_gate: bool = False,
+) -> dict[str, Any]:
     require(isinstance(payload, dict), "memory output must be a JSON object")
+    evidence_status = payload.get("evidence_status")
+    evidence_status_reason = payload.get("evidence_status_reason")
+    answer_policy = payload.get("answer_policy")
     memory_markdown = payload.get("memory_markdown")
     trajectory_spans = payload.get("trajectory_spans")
+    has_evidence_gate = any(
+        key in payload
+        for key in ("evidence_status", "evidence_status_reason", "answer_policy")
+    )
+    if require_evidence_gate or has_evidence_gate:
+        require(isinstance(evidence_status, str), "evidence_status must be a string")
+        evidence_status = evidence_status.strip()
+        require(
+            evidence_status in VALID_EVIDENCE_STATUSES,
+            (
+                "evidence_status must be one of: "
+                + ", ".join(sorted(VALID_EVIDENCE_STATUSES))
+            ),
+        )
+        require(
+            isinstance(evidence_status_reason, str) and evidence_status_reason.strip(),
+            "evidence_status_reason must be a non-empty string",
+        )
+        evidence_status_reason = evidence_status_reason.strip()
+        require(isinstance(answer_policy, str), "answer_policy must be a string")
+        answer_policy = answer_policy.strip()
+        require(
+            answer_policy in VALID_ANSWER_POLICIES,
+            "answer_policy must be one of: " + ", ".join(sorted(VALID_ANSWER_POLICIES)),
+        )
+        expected_answer_policy = ANSWER_POLICY_BY_EVIDENCE_STATUS[evidence_status]
+        require(
+            answer_policy == expected_answer_policy,
+            (
+                f"answer_policy must be {expected_answer_policy!r} "
+                f"when evidence_status is {evidence_status!r}"
+            ),
+        )
     require(isinstance(memory_markdown, str), "memory_markdown must be a string")
     require(isinstance(trajectory_spans, list), "trajectory_spans must be a list")
 
@@ -226,13 +281,26 @@ def validate_memory_module_output_payload(payload: Any) -> dict[str, Any]:
                 "end_state_index": end_state_index,
             }
         )
-    return {
+    normalized: dict[str, Any] = {
         "memory_markdown": memory_markdown,
         "trajectory_spans": normalized_spans,
     }
+    if require_evidence_gate or has_evidence_gate:
+        normalized.update(
+            {
+                "evidence_status": evidence_status,
+                "evidence_status_reason": evidence_status_reason,
+                "answer_policy": answer_policy,
+            }
+        )
+    return normalized
 
 
-def read_memory_output_status(output_path: Path) -> MemoryOutputStatus:
+def read_memory_output_status(
+    output_path: Path,
+    *,
+    require_evidence_gate: bool = False,
+) -> MemoryOutputStatus:
     if not output_path.exists():
         return MemoryOutputStatus("missing_output_file", None)
     try:
@@ -240,7 +308,10 @@ def read_memory_output_status(output_path: Path) -> MemoryOutputStatus:
     except json.JSONDecodeError as exc:
         return MemoryOutputStatus("invalid_json", f"{exc.msg} at line {exc.lineno} column {exc.colno}")
     try:
-        validate_memory_module_output_payload(payload)
+        validate_memory_module_output_payload(
+            payload,
+            require_evidence_gate=require_evidence_gate,
+        )
     except RuntimeError as exc:
         return MemoryOutputStatus("invalid_payload", str(exc))
     return MemoryOutputStatus("finished", None)
@@ -379,6 +450,7 @@ class CodexMemory(Memory):
         )
         max_attempts_raw = codex_params.get("max_attempts", codex_params.get("max_retries", DEFAULT_CODEX_MAX_ATTEMPTS))
         codex_prompt = codex_params.get("prompt", DEFAULT_PROMPT)
+        require_evidence_gate = codex_params.get("require_evidence_gate", False)
         extra_config_obj = codex_params.get("extra_config", [])
         extra_args_obj = codex_params.get("extra_args", [])
 
@@ -410,6 +482,10 @@ class CodexMemory(Memory):
             isinstance(codex_prompt, str) and codex_prompt.strip(),
             "codex codex_params.prompt must be a non-empty string",
         )
+        require(
+            isinstance(require_evidence_gate, bool),
+            "codex codex_params.require_evidence_gate must be a boolean",
+        )
 
         self.questions_path = Path(questions_path).resolve()
         self.question_by_id, self.question_id_by_text = load_question_index(self.questions_path)
@@ -430,6 +506,7 @@ class CodexMemory(Memory):
         self.codex_timeout_seconds = float(codex_timeout_seconds)
         self.codex_max_attempts = int(max_attempts_raw)
         self.codex_prompt = codex_prompt.strip()
+        self.require_evidence_gate = require_evidence_gate
         self.codex_extra_config = ensure_string_list(extra_config_obj, field_name="codex_params.extra_config")
         self.codex_extra_args = ensure_string_list(extra_args_obj, field_name="codex_params.extra_args")
 
@@ -481,6 +558,7 @@ class CodexMemory(Memory):
                 "timeout_seconds": self.codex_timeout_seconds,
                 "max_retries": self.codex_max_attempts,
                 "prompt": self.codex_prompt,
+                "require_evidence_gate": self.require_evidence_gate,
                 "extra_config": list(self.codex_extra_config),
                 "extra_args": list(self.codex_extra_args),
             },
@@ -790,13 +868,24 @@ class CodexMemory(Memory):
         self,
         output_path: Path,
     ) -> dict[str, Any]:
-        payload = validate_memory_module_output_payload(load_json(output_path))
+        payload = validate_memory_module_output_payload(
+            load_json(output_path),
+            require_evidence_gate=self.require_evidence_gate,
+        )
         normalized: dict[str, Any] = {
             "memory_markdown": payload["memory_markdown"],
             "trajectory_spans_raw": payload["trajectory_spans"],
             "trajectory_spans_valid": [],
             "trajectory_spans_invalid": [],
         }
+        if "evidence_status" in payload:
+            normalized.update(
+                {
+                    "evidence_status": payload["evidence_status"],
+                    "evidence_status_reason": payload["evidence_status_reason"],
+                    "answer_policy": payload["answer_policy"],
+                }
+            )
         for span in payload["trajectory_spans"]:
             trajectory = self._load_stored_trajectory(span["trajectory_id"])
             if trajectory is None:
@@ -977,7 +1066,10 @@ class CodexMemory(Memory):
         if events:
             save_json(events_path, events)
 
-        status = read_memory_output_status(output_path)
+        status = read_memory_output_status(
+            output_path,
+            require_evidence_gate=self.require_evidence_gate,
+        )
         raw_output_text = output_path.read_text(encoding="utf-8") if output_path.exists() else None
         summary: dict[str, Any] = {
             "question_id": question_id,
@@ -1036,15 +1128,22 @@ class CodexMemory(Memory):
                 "memory_context": [],
             }
 
-        summary.update(
-            {
-                "memory_markdown": normalized_output["memory_markdown"],
-                "trajectory_spans_raw": normalized_output["trajectory_spans_raw"],
-                "trajectory_spans_valid": normalized_output["trajectory_spans_valid"],
-                "trajectory_spans_invalid": normalized_output["trajectory_spans_invalid"],
-                "memory_context_item_count": len(memory_context),
-            }
-        )
+        summary_fields = {
+            "memory_markdown": normalized_output["memory_markdown"],
+            "trajectory_spans_raw": normalized_output["trajectory_spans_raw"],
+            "trajectory_spans_valid": normalized_output["trajectory_spans_valid"],
+            "trajectory_spans_invalid": normalized_output["trajectory_spans_invalid"],
+            "memory_context_item_count": len(memory_context),
+        }
+        if "evidence_status" in normalized_output:
+            summary_fields.update(
+                {
+                    "evidence_status": normalized_output["evidence_status"],
+                    "evidence_status_reason": normalized_output["evidence_status_reason"],
+                    "answer_policy": normalized_output["answer_policy"],
+                }
+            )
+        summary.update(summary_fields)
         save_json(summary_path, summary)
         return {
             "success": True,
