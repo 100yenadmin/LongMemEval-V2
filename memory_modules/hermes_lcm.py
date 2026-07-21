@@ -82,6 +82,23 @@ def _bounded_int(
     return value
 
 
+def _bounded_float(
+    params: dict[str, object],
+    key: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    value = params.get(key)
+    require(
+        isinstance(value, (int, float)) and not isinstance(value, bool),
+        f"hermes_lcm {key} must be a number",
+    )
+    number = float(value)
+    require(minimum <= number <= maximum, f"hermes_lcm {key} must be between {minimum} and {maximum}")
+    return number
+
+
 @register_memory
 class HermesLCMMemory(Memory):
     """Thin official adapter over the product-owned ``TrajectoryStore``."""
@@ -103,11 +120,31 @@ class HermesLCMMemory(Memory):
         "max_image_items",
         "include_adjacent",
         "protect_sensitive",
+        "semantic_enabled",
+        "semantic_provider",
+        "semantic_model",
+        "semantic_top_trajectories",
+        "semantic_build_timeout_seconds",
+        "semantic_query_timeout_seconds",
     })
 
     def __init__(self, memory_params: dict[str, object]) -> None:
         unexpected = sorted(set(memory_params) - self._ALLOWED_PARAMS)
         require(not unexpected, f"hermes_lcm memory_params contains unexpected keys: {unexpected}")
+        semantic_enabled = bool(memory_params.get("semantic_enabled", False))
+        require(
+            isinstance(memory_params.get("semantic_enabled", False), bool),
+            "hermes_lcm semantic_enabled must be a boolean",
+        )
+        semantic_provider = str(memory_params.get("semantic_provider", "") or "").strip()
+        semantic_model = str(memory_params.get("semantic_model", "") or "").strip()
+        if semantic_enabled:
+            require(semantic_provider, "hermes_lcm semantic_provider must be set when enabled")
+            require(semantic_model, "hermes_lcm semantic_model must be set when enabled")
+        semantic_params = dict(memory_params)
+        semantic_params.setdefault("semantic_top_trajectories", 12)
+        semantic_params.setdefault("semantic_build_timeout_seconds", 120.0)
+        semantic_params.setdefault("semantic_query_timeout_seconds", 5.0)
         normalized: dict[str, object] = {
             "workspace_root": str(Path(_required_text(memory_params, "workspace_root")).expanduser().resolve()),
             "trajectories_root_dir": str(Path(_required_text(memory_params, "trajectories_root_dir")).expanduser().resolve()),
@@ -127,6 +164,27 @@ class HermesLCMMemory(Memory):
             "max_image_items": _bounded_int(memory_params, "max_image_items", minimum=0, maximum=8),
             "include_adjacent": _required_bool(memory_params, "include_adjacent"),
             "protect_sensitive": _required_bool(memory_params, "protect_sensitive"),
+            "semantic_enabled": semantic_enabled,
+            "semantic_provider": semantic_provider,
+            "semantic_model": semantic_model,
+            "semantic_top_trajectories": _bounded_int(
+                semantic_params,
+                "semantic_top_trajectories",
+                minimum=1,
+                maximum=32,
+            ),
+            "semantic_build_timeout_seconds": _bounded_float(
+                semantic_params,
+                "semantic_build_timeout_seconds",
+                minimum=0.1,
+                maximum=600.0,
+            ),
+            "semantic_query_timeout_seconds": _bounded_float(
+                semantic_params,
+                "semantic_query_timeout_seconds",
+                minimum=0.1,
+                maximum=30.0,
+            ),
         }
         workspace_root = Path(str(normalized["workspace_root"]))
         data_root = Path(str(normalized["trajectories_root_dir"]))
@@ -138,6 +196,12 @@ class HermesLCMMemory(Memory):
         self._db_path: Path | None = None
         self._ordered_ids: list[str] = []
         self._last_query_metadata: dict[str, object] = {}
+        self._semantic_ready = False
+        self._semantic_setup_status = (
+            "pending" if bool(normalized["semantic_enabled"]) else "disabled"
+        )
+        self._semantic_setup_error: str | None = None
+        self._semantic_setup_fallbacks = 0
         self.last_query_latency_seconds = 0.0
         self.read_only = False
 
@@ -157,6 +221,17 @@ class HermesLCMMemory(Memory):
         require(requested_config.get("memory_type") == cls.memory_type, "requested memory type mismatch")
         saved_params = dict(saved_config["memory_params"])
         requested_params = dict(requested_config["memory_params"])
+        semantic_defaults: dict[str, object] = {
+            "semantic_enabled": False,
+            "semantic_provider": "",
+            "semantic_model": "",
+            "semantic_top_trajectories": 12,
+            "semantic_build_timeout_seconds": 120.0,
+            "semantic_query_timeout_seconds": 5.0,
+        }
+        for key, value in semantic_defaults.items():
+            saved_params.setdefault(key, value)
+            requested_params.setdefault(key, value)
         runtime_paths = {"workspace_root", "trajectories_root_dir"}
         require(
             {key: value for key, value in saved_params.items() if key not in runtime_paths}
@@ -194,6 +269,9 @@ class HermesLCMMemory(Memory):
             self._identity(),
             asset_root=Path(str(self.memory_params["trajectories_root_dir"])),
             protect_sensitive=bool(self.memory_params["protect_sensitive"]),
+            semantic_top_trajectories=int(
+                self.memory_params["semantic_top_trajectories"]
+            ),
         )
         return self._store
 
@@ -249,6 +327,45 @@ class HermesLCMMemory(Memory):
         if self._store.status != "complete":
             require(not self.read_only, "loaded Hermes-LCM corpus is incomplete")
             self._store.finalize(self._ordered_ids)
+        if bool(self.memory_params["semantic_enabled"]) and not self._semantic_ready:
+            try:
+                if self.read_only:
+                    provider = self._api.create_trajectory_embedding_provider(
+                        str(self.memory_params["semantic_provider"]),
+                        str(self.memory_params["semantic_model"]),
+                        timeout_seconds=float(
+                            self.memory_params["semantic_query_timeout_seconds"]
+                        ),
+                        for_backfill=False,
+                    )
+                    self._store.set_embedding_provider(provider)
+                else:
+                    build_provider = self._api.create_trajectory_embedding_provider(
+                        str(self.memory_params["semantic_provider"]),
+                        str(self.memory_params["semantic_model"]),
+                        timeout_seconds=float(
+                            self.memory_params["semantic_build_timeout_seconds"]
+                        ),
+                        for_backfill=True,
+                    )
+                    self._store.build_semantic_index(build_provider)
+                    query_provider = self._api.create_trajectory_embedding_provider(
+                        str(self.memory_params["semantic_provider"]),
+                        str(self.memory_params["semantic_model"]),
+                        timeout_seconds=float(
+                            self.memory_params["semantic_query_timeout_seconds"]
+                        ),
+                        for_backfill=False,
+                    )
+                    self._store.set_embedding_provider(query_provider)
+                self._semantic_setup_status = "ready"
+                self._semantic_setup_error = None
+            except Exception as exc:
+                self._store.set_embedding_provider(None)
+                self._semantic_setup_status = "fallback"
+                self._semantic_setup_error = type(exc).__name__
+                self._semantic_setup_fallbacks = 1
+            self._semantic_ready = True
 
     @staticmethod
     def _render_hit(hit) -> str:
@@ -299,6 +416,7 @@ class HermesLCMMemory(Memory):
             if hit.screenshot_path is not None:
                 context.append({"type": "image", "value": hit.screenshot_path})
         self.last_query_latency_seconds = time.perf_counter() - started
+        semantic_metrics = self._store.semantic_metrics()
         self._last_query_metadata = {
             "backend": self.memory_type,
             "corpus_uid": self._store.corpus_uid,
@@ -306,7 +424,22 @@ class HermesLCMMemory(Memory):
             "query_digest": self._store.query_digest(hits),
             "text_items": len(hits),
             "image_items": sum(hit.screenshot_path is not None for hit in hits),
-            "provider_calls": 0,
+            "semantic_enabled": bool(self.memory_params["semantic_enabled"]),
+            "semantic_provider": str(self.memory_params["semantic_provider"]),
+            "semantic_model": str(self.memory_params["semantic_model"]),
+            "semantic_setup_status": self._semantic_setup_status,
+            "semantic_setup_error": self._semantic_setup_error,
+            "embedding_document_calls": semantic_metrics["document_calls"],
+            "embedding_document_tokens": semantic_metrics["document_tokens"],
+            "embedding_query_calls": semantic_metrics["query_calls"],
+            "embedding_query_tokens": semantic_metrics["query_tokens"],
+            "embedding_fallbacks": (
+                semantic_metrics["fallbacks"] + self._semantic_setup_fallbacks
+            ),
+            "provider_calls": (
+                semantic_metrics["document_calls"]
+                + semantic_metrics["query_calls"]
+            ),
         }
         return context
 
@@ -337,6 +470,7 @@ class HermesLCMMemory(Memory):
         require(manifest_path.is_file(), "saved Hermes-LCM memory is missing corpus-manifest.json")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         require(isinstance(manifest, dict), "saved Hermes-LCM corpus manifest must be an object")
+        manifest.setdefault("semantic_index", None)
         if self._store is not None:
             self._store.close()
         self._db_path = database_path
@@ -346,9 +480,13 @@ class HermesLCMMemory(Memory):
             asset_root=Path(str(self.memory_params["trajectories_root_dir"])),
             read_only=True,
             protect_sensitive=bool(self.memory_params["protect_sensitive"]),
+            semantic_top_trajectories=int(
+                self.memory_params["semantic_top_trajectories"]
+            ),
         )
         require(self._store.manifest() == manifest, "saved Hermes-LCM corpus manifest mismatch")
         self.read_only = True
+        self._semantic_ready = False
 
     def close(self) -> None:
         if self._store is not None:

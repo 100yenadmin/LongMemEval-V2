@@ -76,6 +76,35 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("LME_DATASET_REVISION", ""),
         help="Exact downloaded dataset revision; required for hermes_lcm",
     )
+    parser.add_argument(
+        "--hermes-semantic-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("HERMES_LCM_SEMANTIC_ENABLED", False),
+        help="Enable same-database trajectory semantic selection for hermes_lcm",
+    )
+    parser.add_argument(
+        "--hermes-semantic-provider",
+        default=os.getenv("HERMES_LCM_SEMANTIC_PROVIDER", ""),
+    )
+    parser.add_argument(
+        "--hermes-semantic-model",
+        default=os.getenv("HERMES_LCM_SEMANTIC_MODEL", ""),
+    )
+    parser.add_argument(
+        "--hermes-semantic-top-trajectories",
+        type=int,
+        default=int(os.getenv("HERMES_LCM_SEMANTIC_TOP_TRAJECTORIES", "12")),
+    )
+    parser.add_argument(
+        "--hermes-semantic-build-timeout-seconds",
+        type=float,
+        default=float(os.getenv("HERMES_LCM_SEMANTIC_BUILD_TIMEOUT_SECONDS", "120")),
+    )
+    parser.add_argument(
+        "--hermes-semantic-query-timeout-seconds",
+        type=float,
+        default=float(os.getenv("HERMES_LCM_SEMANTIC_QUERY_TIMEOUT_SECONDS", "5")),
+    )
 
     parser.add_argument("--reader-model", default=os.getenv("READER_MODEL", "Qwen/Qwen3.5-9B"))
     parser.add_argument("--reader-base-url", default=os.getenv("READER_BASE_URL", "http://localhost:8023/v1"))
@@ -258,6 +287,24 @@ def build_memory_config(
                 "max_image_items": 8,
                 "include_adjacent": True,
                 "protect_sensitive": True,
+                "semantic_enabled": bool(
+                    getattr(args, "hermes_semantic_enabled", False)
+                ),
+                "semantic_provider": str(
+                    getattr(args, "hermes_semantic_provider", "") or ""
+                ).strip(),
+                "semantic_model": str(
+                    getattr(args, "hermes_semantic_model", "") or ""
+                ).strip(),
+                "semantic_top_trajectories": int(
+                    getattr(args, "hermes_semantic_top_trajectories", 12)
+                ),
+                "semantic_build_timeout_seconds": float(
+                    getattr(args, "hermes_semantic_build_timeout_seconds", 120.0)
+                ),
+                "semantic_query_timeout_seconds": float(
+                    getattr(args, "hermes_semantic_query_timeout_seconds", 5.0)
+                ),
             },
         }
     codex_params = {

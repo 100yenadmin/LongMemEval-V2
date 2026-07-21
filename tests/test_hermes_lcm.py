@@ -31,6 +31,32 @@ from evaluation import run_eval  # noqa: E402
 from memory_modules import hermes_lcm as hermes_adapter  # noqa: E402
 
 
+class _FakeTrajectoryProvider:
+    provider_id = "fake"
+    model_id = "fake-trajectory-v1"
+    dim = 2
+
+    def __init__(self):
+        self.document_calls = 0
+        self.query_calls = 0
+        self.last_usage_tokens = 0
+
+    def embed_documents(self, texts):
+        self.document_calls += 1
+        self.last_usage_tokens = len(texts)
+        return [[1.0, 0.0] for _text in texts]
+
+    def embed_query(self, text):
+        self.query_calls += 1
+        self.last_usage_tokens = 1
+        return [1.0, 0.0]
+
+
+class _FailingTrajectoryProvider(_FakeTrajectoryProvider):
+    def embed_documents(self, texts):
+        raise RuntimeError("synthetic semantic build failure")
+
+
 def _write_png(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"png" + payload)
@@ -90,6 +116,19 @@ def _config(tmp_path: Path, data_root: Path) -> dict[str, object]:
             "protect_sensitive": True,
         },
     }
+
+
+def _semantic_config(tmp_path: Path, data_root: Path) -> dict[str, object]:
+    config = _config(tmp_path, data_root)
+    config["memory_params"].update({
+        "semantic_enabled": True,
+        "semantic_provider": "fake",
+        "semantic_model": "fake-trajectory-v1",
+        "semantic_top_trajectories": 4,
+        "semantic_build_timeout_seconds": 30.0,
+        "semantic_query_timeout_seconds": 3.0,
+    })
+    return config
 
 
 def _built_memory(tmp_path: Path):
@@ -334,6 +373,9 @@ def test_run_eval_builds_pinned_config_and_rejects_parallel_prompt_workers(
     assert params["harness_commit"] == run_eval.OFFICIAL_HARNESS_COMMIT
     assert params["protect_sensitive"] is True
     assert params["max_text_chars_per_item"] == 2000
+    assert params["semantic_enabled"] is False
+    assert params["semantic_provider"] == ""
+    assert params["semantic_model"] == ""
 
     monkeypatch.setattr(
         "sys.argv",
@@ -355,3 +397,119 @@ def test_run_eval_builds_pinned_config_and_rejects_parallel_prompt_workers(
     )
     with pytest.raises(SystemExit, match="prompt-build-max-workers 1"):
         run_eval.main()
+
+
+def test_semantic_mode_builds_before_query_and_reports_provider_usage(
+    tmp_path: Path,
+    monkeypatch,
+):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    memory = build_memory(_semantic_config(tmp_path, data_root))
+    provider = _FakeTrajectoryProvider()
+    monkeypatch.setattr(
+        memory._api,
+        "create_trajectory_embedding_provider",
+        lambda *_args, **_kwargs: provider,
+    )
+    try:
+        memory.insert(_trajectory(data_root))
+        context = memory.query("Why did export fail?")
+        metadata = memory.post_query_hook(
+            query="Why did export fail?",
+            query_image=None,
+            memory_context=context,
+        )
+        assert provider.document_calls == 1
+        assert provider.query_calls == 1
+        assert metadata["semantic_enabled"] is True
+        assert metadata["semantic_provider"] == "fake"
+        assert metadata["semantic_model"] == "fake-trajectory-v1"
+        assert metadata["embedding_document_calls"] == 1
+        assert metadata["embedding_query_calls"] == 1
+        assert memory._store.manifest()["semantic_index"]["document_count"] == 1
+    finally:
+        memory.close()
+
+
+def test_semantic_config_has_no_credentials_and_disabled_mode_stays_provider_free(
+    tmp_path: Path,
+    monkeypatch,
+):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    config = _config(tmp_path, data_root)
+    memory = build_memory(config)
+    monkeypatch.setattr(
+        memory._api,
+        "create_trajectory_embedding_provider",
+        lambda *_args, **_kwargs: pytest.fail("disabled mode resolved a provider"),
+    )
+    try:
+        memory.insert(_trajectory(data_root))
+        context = memory.query("storage quota")
+        metadata = memory.post_query_hook(
+            query="storage quota",
+            query_image=None,
+            memory_context=context,
+        )
+        assert metadata["provider_calls"] == 0
+        assert memory._store.manifest()["semantic_index"] is None
+        assert not any("key" in key.casefold() or "token" in key.casefold()
+                       for key in memory.memory_params)
+    finally:
+        memory.close()
+
+
+def test_semantic_build_failure_falls_back_to_exact_fts_without_aborting(
+    tmp_path: Path,
+    monkeypatch,
+):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    memory = build_memory(_semantic_config(tmp_path, data_root))
+    monkeypatch.setattr(
+        memory._api,
+        "create_trajectory_embedding_provider",
+        lambda *_args, **_kwargs: _FailingTrajectoryProvider(),
+    )
+    try:
+        memory.insert(_trajectory(data_root))
+        context = memory.query("storage quota")
+        metadata = memory.post_query_hook(
+            query="storage quota",
+            query_image=None,
+            memory_context=context,
+        )
+        rendered = "\n".join(
+            item["value"] for item in context if item["type"] == "text"
+        )
+        assert "storage quota" in rendered
+        assert metadata["semantic_setup_status"] == "fallback"
+        assert metadata["semantic_setup_error"] == "RuntimeError"
+        assert metadata["embedding_fallbacks"] == 1
+    finally:
+        memory.close()
+
+
+def test_load_accepts_legacy_manifest_without_optional_semantic_index(
+    tmp_path: Path,
+):
+    _data_root, memory = _built_memory(tmp_path)
+    save_dir = tmp_path / "legacy-save"
+    try:
+        save_memory(memory, save_dir)
+    finally:
+        memory.close()
+    manifest_path = save_dir / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest.pop("semantic_index") is None
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    restored = load_memory(save_dir)
+    try:
+        assert restored.query("storage quota")
+    finally:
+        restored.close()
