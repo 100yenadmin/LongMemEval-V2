@@ -1,7 +1,8 @@
 import json
 import os
 import re
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Callable, Iterable, List, Sequence, Tuple
 
 
 DEFAULT_SEPARATORS: Sequence[str] = (",", ";")
@@ -234,6 +235,7 @@ def llm_abstention_checker(
     evaluator_temperature: float | None = None,
     evaluator_top_p: float | None = None,
     evaluator_timeout_seconds: float = 43200.0,
+    evaluator_trace: dict[str, Any] | None = None,
     require_non_empty: bool = True,
     **_: Any,
 ) -> bool:
@@ -282,8 +284,11 @@ def llm_abstention_checker(
         temperature=evaluator_temperature,
         top_p=evaluator_top_p,
         timeout_seconds=evaluator_timeout_seconds,
+        trace_out=evaluator_trace,
     )
-    label, _reason = _parse_llm_binary_judgement(judge_text)
+    label, reason = _parse_llm_binary_judgement(judge_text)
+    if evaluator_trace is not None:
+        evaluator_trace.update({"parsed_label": label, "parsed_reason": reason})
     return label == 1
 
 
@@ -303,6 +308,7 @@ def llm_gotchas_checker(
     evaluator_temperature: float | None = None,
     evaluator_top_p: float | None = None,
     evaluator_timeout_seconds: float = 43200.0,
+    evaluator_trace: dict[str, Any] | None = None,
     require_non_empty: bool = True,
     **_: Any,
 ) -> bool:
@@ -351,8 +357,11 @@ def llm_gotchas_checker(
         temperature=evaluator_temperature,
         top_p=evaluator_top_p,
         timeout_seconds=evaluator_timeout_seconds,
+        trace_out=evaluator_trace,
     )
-    label, _reason = _parse_llm_binary_judgement(judge_text)
+    label, reason = _parse_llm_binary_judgement(judge_text)
+    if evaluator_trace is not None:
+        evaluator_trace.update({"parsed_label": label, "parsed_reason": reason})
     return label == 1
 
 
@@ -513,6 +522,7 @@ def _call_chat_completion(
     temperature: float | None,
     top_p: float | None,
     timeout_seconds: float,
+    trace_out: dict[str, Any] | None = None,
 ) -> str:
     request: dict[str, Any] = {
         "model": model,
@@ -527,20 +537,49 @@ def _call_chat_completion(
     if top_p is not None:
         request["top_p"] = top_p
 
+    started_at = time.perf_counter()
     response = client.chat.completions.create(**request)
+    latency_seconds = time.perf_counter() - started_at
     message_content = response.choices[0].message.content
+    judge_text = ""
     if isinstance(message_content, str):
-        return message_content.strip()
-    if isinstance(message_content, list):
+        judge_text = message_content.strip()
+    elif isinstance(message_content, list):
         text_parts = []
         for item in message_content:
             if isinstance(item, dict):
                 text = item.get("text")
                 if isinstance(text, str):
                     text_parts.append(text)
-        joined = "\n".join(text_parts).strip()
-        if joined:
-            return joined
+        judge_text = "\n".join(text_parts).strip()
+
+    usage = getattr(response, "usage", None)
+    usage_dict = {
+        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+    }
+    if trace_out is not None:
+        choice = response.choices[0]
+        trace_out.update(
+            {
+                "kind": "model",
+                "transport": "openai_chat_completions",
+                "requested_model": model,
+                "actual_model": str(getattr(response, "model", "") or ""),
+                "response_id": str(getattr(response, "id", "") or ""),
+                "finish_reason": str(getattr(choice, "finish_reason", "") or ""),
+                "reasoning_effort": reasoning_effort,
+                "max_completion_tokens": max_completion_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "latency_seconds": latency_seconds,
+                "usage": usage_dict,
+                "judge_output": judge_text,
+            }
+        )
+    if judge_text:
+        return judge_text
     raise ValueError("Evaluator model returned empty response content.")
 
 

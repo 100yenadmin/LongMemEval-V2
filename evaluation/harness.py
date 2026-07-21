@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from openai import AsyncOpenAI, BadRequestError
 from tqdm import tqdm
@@ -894,11 +894,35 @@ async def call_reader_model_async(
     client: AsyncOpenAI,
     args: argparse.Namespace,
     messages: list[dict[str, Any]],
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, int], dict[str, Any]]:
+    started_at = time.perf_counter()
     response = await client.chat.completions.create(**build_reader_request(args, messages))
+    latency_seconds = time.perf_counter() - started_at
     text = extract_text_from_response_message(response.choices[0].message)
     require(text != "", "Model returned empty text")
-    return text, extract_usage_dict(response)
+    usage = extract_usage_dict(response)
+    choice = response.choices[0]
+    trace = {
+        "kind": "model",
+        "transport": "openai_compatible_chat_completions",
+        "requested_model": args.model,
+        "actual_model": str(getattr(response, "model", "") or ""),
+        "response_id": str(getattr(response, "id", "") or ""),
+        "finish_reason": str(getattr(choice, "finish_reason", "") or ""),
+        "latency_seconds": latency_seconds,
+        "usage": usage,
+        "request_parameters": {
+            "max_completion_tokens": args.max_completion_tokens,
+            "reasoning_effort": args.reasoning_effort,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "repetition_penalty": args.repetition_penalty,
+            "presence_penalty": args.presence_penalty,
+            "thinking_enabled": args.reader_enable_thinking,
+        },
+    }
+    return text, usage, trace
 
 
 async def generate_all_reader_outputs(
@@ -915,7 +939,9 @@ async def generate_all_reader_outputs(
     async def run_one(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         async with semaphore:
             try:
-                response_raw, usage = await call_reader_model_async(client, args, row["messages"])
+                response_raw, usage, reader_trace = await call_reader_model_async(
+                    client, args, row["messages"]
+                )
             except BadRequestError as exc:
                 print(
                     f"Reader request failed for question_id={row['question_id']}: {exc}. "
@@ -925,12 +951,24 @@ async def generate_all_reader_outputs(
                 )
                 response_raw = ""
                 usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                reader_trace = {
+                    "kind": "model_error",
+                    "transport": "openai_compatible_chat_completions",
+                    "requested_model": args.model,
+                    "actual_model": "",
+                    "finish_reason": "",
+                    "latency_seconds": None,
+                    "usage": usage,
+                    "status": "bad_request",
+                    "error_type": type(exc).__name__,
+                }
         parsed_answer = extract_boxed_answer(response_raw)
         return row["question_id"], {
             "response_raw": response_raw,
             "response_parsed_boxed": parsed_answer,
             "is_unknown": is_unknown(parsed_answer),
             "usage": usage,
+            "reader_trace": reader_trace,
         }
 
     tasks = [asyncio.create_task(run_one(row)) for row in prompt_rows]
@@ -1013,6 +1051,53 @@ def aggregate_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def aggregate_trace_metrics(
+    records: list[dict[str, Any]],
+    *,
+    trace_key: str,
+    stage_latency_key: str = "latency_seconds",
+) -> dict[str, Any]:
+    traces = [record.get(trace_key) for record in records]
+    traces = [trace for trace in traces if isinstance(trace, dict)]
+    latencies = [
+        float(trace[stage_latency_key])
+        for trace in traces
+        if isinstance(trace.get(stage_latency_key), (int, float))
+    ]
+    actual_models: dict[str, int] = {}
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for trace in traces:
+        actual_model = trace.get("actual_model")
+        if isinstance(actual_model, str) and actual_model:
+            actual_models[actual_model] = actual_models.get(actual_model, 0) + 1
+        trace_usage = trace.get("usage")
+        if isinstance(trace_usage, dict):
+            for key in usage:
+                usage[key] += int(trace_usage.get(key, 0) or 0)
+    return {
+        "record_count": len(traces),
+        "model_call_count": sum(1 for trace in traces if trace.get("kind") == "model"),
+        "deterministic_call_count": sum(
+            1 for trace in traces if trace.get("kind") == "deterministic"
+        ),
+        "actual_models": actual_models,
+        "usage": usage,
+        "latency_seconds": {
+            "avg": sum(latencies) / len(latencies) if latencies else None,
+            "p50": sorted(latencies)[len(latencies) // 2] if latencies else None,
+            "p95": (
+                sorted(latencies)[
+                    min(len(latencies) - 1, int(0.95 * len(latencies)))
+                ]
+                if latencies
+                else None
+            ),
+            "max": max(latencies) if latencies else None,
+            "total": sum(latencies),
+        },
+    }
+
+
 def make_eval_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "evaluator_model": args.evaluator_model,
@@ -1027,29 +1112,56 @@ def make_eval_config(args: argparse.Namespace) -> dict[str, Any]:
 def score_prediction(
     row: dict[str, Any],
     eval_config: dict[str, Any],
-) -> tuple[bool, str, bool]:
+) -> tuple[bool, str, bool, dict[str, Any]]:
     q_eval_name = row["eval_name"]
     eval_kwargs: dict[str, Any] = {}
+    evaluator_trace: dict[str, Any] = {}
     if q_eval_name in LLM_EVAL_FUNCTIONS:
         eval_kwargs.update(eval_config)
         eval_kwargs["question_item"] = row["question_item"]
         eval_kwargs["parsed_prediction"] = row["response_parsed_boxed"]
         eval_kwargs["model_response"] = row["response_raw"]
+        eval_kwargs["evaluator_trace"] = evaluator_trace
 
     prediction_for_eval = row["response_parsed_boxed"]
     if q_eval_name in LLM_EVAL_FUNCTIONS:
         prediction_for_eval = row["response_raw"]
 
+    started_at = time.perf_counter()
     score_raw = eval_from_spec(
         row["eval_function"],
         prediction_for_eval,
         row["answer_gold"],
         **eval_kwargs,
     )
+    score_latency_seconds = time.perf_counter() - started_at
     score_bool = score_to_bool(score_raw)
     if row["is_unknown"]:
         score_bool = False
-    return score_bool, q_eval_name, row["is_unknown"]
+    if not evaluator_trace:
+        evaluator_trace.update(
+            {
+                "kind": "deterministic",
+                "transport": "local_function",
+                "requested_model": None,
+                "actual_model": None,
+                "latency_seconds": score_latency_seconds,
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+        )
+    evaluator_trace.update(
+        {
+            "eval_name": q_eval_name,
+            "score_bool": score_bool,
+            "is_unknown_override": bool(row["is_unknown"]),
+            "score_latency_seconds": score_latency_seconds,
+        }
+    )
+    return score_bool, q_eval_name, row["is_unknown"], evaluator_trace
 
 
 def main() -> None:
@@ -1394,8 +1506,9 @@ def main() -> None:
                 "response_parsed_boxed": output["response_parsed_boxed"],
                 "is_unknown": output["is_unknown"],
                 "usage": output["usage"],
+                "reader_trace": output["reader_trace"],
             }
-            score_bool, _, _ = score_prediction(row, eval_config)
+            score_bool, _, _, judge_trace = score_prediction(row, eval_config)
 
             record = {
                 "index": row["index"],
@@ -1423,6 +1536,8 @@ def main() -> None:
                 "score": 1.0 if score_bool else 0.0,
                 "score_bool": score_bool,
                 "usage": row["usage"],
+                "reader_trace": row["reader_trace"],
+                "judge_trace": judge_trace,
                 "timestamp_utc": utc_now_iso(),
             }
             fp.write(json.dumps(record, ensure_ascii=True) + "\n")
@@ -1439,6 +1554,15 @@ def main() -> None:
             truncated_sequence_count += int(row["memory_context_was_truncated"])
 
     aggregated = aggregate_metrics(records)
+    aggregated["reader_stage"] = aggregate_trace_metrics(
+        records,
+        trace_key="reader_trace",
+    )
+    aggregated["judge_stage"] = aggregate_trace_metrics(
+        records,
+        trace_key="judge_trace",
+        stage_latency_key="score_latency_seconds",
+    )
     aggregated["tokens"] = {
         "prompt_tokens": total_prompt_tokens,
         "completion_tokens": total_completion_tokens,
