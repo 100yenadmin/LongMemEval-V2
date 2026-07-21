@@ -1,0 +1,357 @@
+"""Official-interface fixtures for the Hermes-LCM trajectory adapter."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+from types import SimpleNamespace
+from types import ModuleType
+
+import pytest
+
+
+PRODUCT_ROOT = Path(
+    os.environ.get(
+        "HERMES_LCM_PRODUCT_ROOT",
+        "/Volumes/LEXAR/repos/hermes-lcm-v2-trajectory-adapter",
+    )
+).resolve()
+os.environ.setdefault("HERMES_LCM_PRODUCT_ROOT", str(PRODUCT_ROOT))
+
+from memory_modules.memory import (  # noqa: E402
+    MEMORY_TYPES,
+    build_memory,
+    load_memory,
+    save_memory,
+)
+from evaluation import run_eval  # noqa: E402
+from memory_modules import hermes_lcm as hermes_adapter  # noqa: E402
+
+
+def _write_png(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"png" + payload)
+
+
+def _trajectory(data_root: Path, trajectory_id: str = "trajectory-a") -> dict[str, object]:
+    screenshots = data_root / "screenshots"
+    for index in range(3):
+        _write_png(screenshots / f"{trajectory_id}-{index}.png", bytes([index]))
+    return {
+        "id": trajectory_id,
+        "goal": "Export the quarterly report",
+        "start_url": "https://example.test/reports",
+        "outcome": "Export failed",
+        "states": [
+            {
+                "url": "https://example.test/reports",
+                "action": None,
+                "thought": "Need to export the report.",
+                "accessibility_tree": "Reports page with an Export button.",
+                "screenshot": f"{trajectory_id}-0.png",
+            },
+            {
+                "url": "https://example.test/reports/export",
+                "action": "Click Export",
+                "thought": "The export should start.",
+                "accessibility_tree": "Export failed because storage quota is full.",
+                "screenshot": f"{trajectory_id}-1.png",
+            },
+            {
+                "url": "https://example.test/settings/storage",
+                "action": "Open storage settings",
+                "thought": "Check quota before retrying.",
+                "accessibility_tree": "Delete an old export before retrying.",
+                "screenshot": f"{trajectory_id}-2.png",
+            },
+        ],
+    }
+
+
+def _config(tmp_path: Path, data_root: Path) -> dict[str, object]:
+    return {
+        "memory_type": "hermes_lcm",
+        "memory_params": {
+            "workspace_root": str((tmp_path / "workspaces").resolve()),
+            "trajectories_root_dir": str(data_root.resolve()),
+            "dataset_name": "example/trajectory-benchmark",
+            "dataset_revision": "dataset-rev-1",
+            "harness_commit": "harness-commit-1",
+            "tier": "small",
+            "domain": "enterprise",
+            "candidate_limit": 16,
+            "max_text_items": 4,
+            "max_text_chars_per_item": 2000,
+            "max_image_items": 2,
+            "include_adjacent": True,
+            "protect_sensitive": True,
+        },
+    }
+
+
+def _built_memory(tmp_path: Path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    memory = build_memory(_config(tmp_path, data_root))
+    memory.insert(_trajectory(data_root))
+    return data_root, memory
+
+
+def test_backend_is_registered_and_builds_through_official_memory_api(tmp_path: Path):
+    assert "hermes_lcm" in MEMORY_TYPES
+    data_root, memory = _built_memory(tmp_path)
+    try:
+        assert memory.memory_type == "hermes_lcm"
+        assert Path(memory.memory_params["trajectories_root_dir"]) == data_root.resolve()
+    finally:
+        memory.close()
+
+
+def test_insert_and_query_return_bounded_exact_text_and_existing_images(tmp_path: Path):
+    _data_root, memory = _built_memory(tmp_path)
+    try:
+        context = memory.query("Why did export fail and what should happen before retrying?")
+        text_items = [item for item in context if item["type"] == "text"]
+        image_items = [item for item in context if item["type"] == "image"]
+        assert 1 <= len(text_items) <= 4
+        assert len(image_items) <= 2
+        assert any("trajectory://" in item["value"] for item in text_items)
+        assert any("storage quota" in item["value"] for item in text_items)
+        assert any("before retrying" in item["value"] for item in text_items)
+        assert all(Path(item["value"]).is_file() for item in image_items)
+    finally:
+        memory.close()
+
+
+def test_query_returns_bounded_verbatim_excerpt_with_stable_exact_ref(tmp_path: Path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    config = _config(tmp_path, data_root)
+    config["memory_params"]["max_text_chars_per_item"] = 512
+    memory = build_memory(config)
+    trajectory = _trajectory(data_root)
+    full_text = "prefix " * 500 + "needle exact answer" + " suffix" * 500
+    trajectory["states"][1]["accessibility_tree"] = full_text
+    try:
+        memory.insert(trajectory)
+        context = memory.query("needle exact answer")
+        rendered = "\n".join(
+            item["value"] for item in context if item["type"] == "text"
+        )
+        assert "Visible state excerpt (offset " in rendered
+        assert "needle exact answer" in rendered
+        assert "trajectory://" in rendered
+        assert full_text not in rendered
+    finally:
+        memory.close()
+
+
+def test_destination_state_action_is_rendered_as_incoming_action(tmp_path: Path):
+    _data_root, memory = _built_memory(tmp_path)
+    try:
+        context = memory.query("Click Export storage quota", query_image=None)
+        rendered = "\n".join(item["value"] for item in context if item["type"] == "text")
+        assert "Incoming action: Click Export" in rendered
+        assert "Outgoing action" not in rendered
+    finally:
+        memory.close()
+
+
+def test_poison_query_context_cannot_change_result_or_trace(tmp_path: Path):
+    _data_root, memory = _built_memory(tmp_path)
+    try:
+        question = "Why did export fail?"
+        memory.set_query_context(
+            question_id="scored-id-a",
+            question_type="secret-type",
+            question_item={"answer": "gold-a", "eval_function": "judge-a"},
+        )
+        first = memory.query(question)
+        first_metadata = memory.post_query_hook(
+            query=question,
+            query_image=None,
+            memory_context=first,
+        )
+        memory.set_query_context(
+            question_id="scored-id-b",
+            question_type="different-type",
+            question_item={"answer": "gold-b", "eval_function": "judge-b"},
+        )
+        second = memory.query(question)
+        second_metadata = memory.post_query_hook(
+            query=question,
+            query_image=None,
+            memory_context=second,
+        )
+        assert second == first
+        assert second_metadata == first_metadata
+        serialized = json.dumps(second_metadata, sort_keys=True)
+        assert "scored-id" not in serialized
+        assert "gold-" not in serialized
+        assert "secret-type" not in serialized
+    finally:
+        memory.close()
+
+
+def test_query_image_is_input_only_and_never_returned(tmp_path: Path):
+    data_root, memory = _built_memory(tmp_path)
+    question_image = data_root / "question.png"
+    _write_png(question_image, b"question")
+    try:
+        context = memory.query("Why did export fail?", query_image=str(question_image))
+        returned_paths = {
+            Path(item["value"]).resolve()
+            for item in context
+            if item["type"] == "image"
+        }
+        assert question_image.resolve() not in returned_paths
+    finally:
+        memory.close()
+
+
+def test_save_load_uses_database_backup_and_preserves_query_bytes(tmp_path: Path):
+    _data_root, memory = _built_memory(tmp_path)
+    save_dir = tmp_path / "saved"
+    try:
+        before = memory.query("storage quota retrying")
+        save_memory(memory, save_dir)
+    finally:
+        memory.close()
+
+    config_text = (save_dir / "memory_config.json").read_text(encoding="utf-8")
+    assert "api_key" not in config_text.casefold()
+    assert "token" not in config_text.casefold()
+    assert (save_dir / "lcm.db").is_file()
+    assert (save_dir / "corpus-manifest.json").is_file()
+
+    restored = load_memory(save_dir)
+    try:
+        after = restored.query("storage quota retrying")
+        assert after == before
+        assert restored.read_only is True
+    finally:
+        restored.close()
+
+
+def test_save_load_allows_only_runtime_paths_to_rebase(tmp_path: Path):
+    data_root, memory = _built_memory(tmp_path)
+    save_dir = tmp_path / "saved-rebase"
+    try:
+        before = memory.query("storage quota")
+        before_metadata = memory.post_query_hook(
+            query="storage quota",
+            query_image=None,
+            memory_context=before,
+        )
+        save_memory(memory, save_dir)
+    finally:
+        memory.close()
+
+    rebased_data = tmp_path / "rebased-data"
+    shutil.copytree(data_root, rebased_data)
+    requested = _config(tmp_path / "rebased-run", rebased_data)
+    restored = load_memory(save_dir, requested_config=requested)
+    try:
+        after = restored.query("storage quota")
+        after_metadata = restored.post_query_hook(
+            query="storage quota",
+            query_image=None,
+            memory_context=after,
+        )
+        assert [item for item in after if item["type"] == "text"] == [
+            item for item in before if item["type"] == "text"
+        ]
+        before_images = [
+            Path(item["value"]).read_bytes()
+            for item in before
+            if item["type"] == "image"
+        ]
+        after_images = [
+            Path(item["value"]).read_bytes()
+            for item in after
+            if item["type"] == "image"
+        ]
+        assert after_images == before_images
+        assert after_metadata == before_metadata
+        assert Path(restored.memory_params["workspace_root"]).is_relative_to(
+            (tmp_path / "rebased-run").resolve()
+        )
+    finally:
+        restored.close()
+
+    incompatible = _config(tmp_path / "other-run", rebased_data)
+    incompatible["memory_params"]["candidate_limit"] = 15
+    with pytest.raises(RuntimeError, match="immutable corpus and retrieval"):
+        load_memory(save_dir, requested_config=incompatible)
+
+
+def test_explicit_product_root_wins_over_preloaded_installed_package(monkeypatch):
+    fake_installed = ModuleType("hermes_lcm")
+    fake_installed.__path__ = ["/definitely/not/the/candidate"]
+    monkeypatch.setitem(sys.modules, "hermes_lcm", fake_installed)
+    monkeypatch.setenv("HERMES_LCM_PRODUCT_ROOT", str(PRODUCT_ROOT))
+    module = hermes_adapter._product_api()
+    assert Path(module.__file__).resolve().is_relative_to(PRODUCT_ROOT)
+    assert module.__name__.startswith("_hermes_lcm_eval_")
+
+
+def test_config_rejects_credentials_and_requires_single_worker_policy(tmp_path: Path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    config = _config(tmp_path, data_root)
+    config["memory_params"]["api_key"] = "must-not-persist"
+    with pytest.raises(RuntimeError, match="unexpected"):
+        build_memory(config)
+
+    clean = _config(tmp_path, data_root)
+    memory = build_memory(clean)
+    try:
+        assert memory.supports_parallel_query is False
+    finally:
+        memory.close()
+
+
+def test_run_eval_builds_pinned_config_and_rejects_parallel_prompt_workers(
+    tmp_path: Path,
+    monkeypatch,
+):
+    data_root = tmp_path / "data"
+    output_dir = tmp_path / "output"
+    data_root.mkdir()
+    args = SimpleNamespace(
+        method="hermes_lcm",
+        dataset_revision="dataset-rev-1",
+        tier="small",
+        domain="web",
+    )
+    config = run_eval.build_memory_config(args, data_root, output_dir)
+    params = config["memory_params"]
+    assert config["memory_type"] == "hermes_lcm"
+    assert params["dataset_revision"] == "dataset-rev-1"
+    assert params["harness_commit"] == run_eval.OFFICIAL_HARNESS_COMMIT
+    assert params["protect_sensitive"] is True
+    assert params["max_text_chars_per_item"] == 2000
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "evaluation.run_eval",
+            "--data-root",
+            str(data_root),
+            "--domain",
+            "web",
+            "--method",
+            "hermes_lcm",
+            "--output-dir",
+            str(output_dir),
+            "--dataset-revision",
+            "dataset-rev-1",
+            "--prompt-build-max-workers",
+            "2",
+        ],
+    )
+    with pytest.raises(SystemExit, match="prompt-build-max-workers 1"):
+        run_eval.main()

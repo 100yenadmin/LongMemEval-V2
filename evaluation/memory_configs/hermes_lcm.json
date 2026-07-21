@@ -1,0 +1,18 @@
+{
+  "memory_type": "hermes_lcm",
+  "memory_params": {
+    "workspace_root": null,
+    "trajectories_root_dir": null,
+    "dataset_name": "xiaowu0162/LongMemEval-V2",
+    "dataset_revision": null,
+    "harness_commit": "6f020ac2fc3275e46c706d3406e02c3ed79b7be2",
+    "tier": "small",
+    "domain": "web",
+    "candidate_limit": 128,
+    "max_text_items": 16,
+    "max_text_chars_per_item": 2000,
+    "max_image_items": 8,
+    "include_adjacent": true,
+    "protect_sensitive": true
+  }
+}

@@ -26,7 +26,10 @@ METHODS = {
     "codex",
     "agentrunbook_c",
     "agentrunbook_c_v2",
+    "hermes_lcm",
 }
+
+OFFICIAL_HARNESS_COMMIT = "6f020ac2fc3275e46c706d3406e02c3ed79b7be2"
 
 OPENAI_SDK_TIMEOUT_SECONDS_BY_REASONING_EFFORT = {
     "low": 200.0,
@@ -68,6 +71,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N selected questions")
     parser.add_argument("--question-ids", nargs="*", default=None, help="Optional question ids, space or comma separated")
+    parser.add_argument(
+        "--dataset-revision",
+        default=os.getenv("LME_DATASET_REVISION", ""),
+        help="Exact downloaded dataset revision; required for hermes_lcm",
+    )
 
     parser.add_argument("--reader-model", default=os.getenv("READER_MODEL", "Qwen/Qwen3.5-9B"))
     parser.add_argument("--reader-base-url", default=os.getenv("READER_BASE_URL", "http://localhost:8023/v1"))
@@ -184,7 +192,11 @@ def openai_sdk_timeout_seconds(args: argparse.Namespace) -> float:
     return OPENAI_SDK_TIMEOUT_SECONDS_BY_REASONING_EFFORT[reasoning_effort]
 
 
-def build_memory_config(args: argparse.Namespace, data_root: Path) -> dict[str, object]:
+def build_memory_config(
+    args: argparse.Namespace,
+    data_root: Path,
+    output_dir: Path | None = None,
+) -> dict[str, object]:
     if args.method == "no_retrieval":
         return {"memory_type": "no_retrieval", "memory_params": {}}
     if args.method in {"rag_query_to_slice", "rag_query_to_slice_notes"}:
@@ -223,6 +235,29 @@ def build_memory_config(args: argparse.Namespace, data_root: Path) -> dict[str, 
                     "rerank_candidate_limit": 8,
                     "enable_rerank": False,
                 },
+            },
+        }
+    if args.method == "hermes_lcm":
+        if not str(args.dataset_revision or "").strip():
+            raise ValueError("--dataset-revision is required for hermes_lcm")
+        if output_dir is None:
+            raise ValueError("output_dir is required to build hermes_lcm memory config")
+        return {
+            "memory_type": "hermes_lcm",
+            "memory_params": {
+                "workspace_root": str((output_dir / "memory_workspaces").resolve()),
+                "trajectories_root_dir": str(data_root.resolve()),
+                "dataset_name": "xiaowu0162/LongMemEval-V2",
+                "dataset_revision": str(args.dataset_revision).strip(),
+                "harness_commit": OFFICIAL_HARNESS_COMMIT,
+                "tier": args.tier,
+                "domain": args.domain,
+                "candidate_limit": 128,
+                "max_text_items": 16,
+                "max_text_chars_per_item": 2000,
+                "max_image_items": 8,
+                "include_adjacent": True,
+                "protect_sensitive": True,
             },
         }
     codex_params = {
@@ -279,6 +314,8 @@ def main() -> None:
         raise SystemExit("--enable-online-learning is only supported with --method agentrunbook_c_v2")
     if args.enable_online_learning and args.prompt_build_max_workers != 1:
         raise SystemExit("--enable-online-learning requires --prompt-build-max-workers 1 for sequential online learning")
+    if args.method == "hermes_lcm" and args.prompt_build_max_workers != 1:
+        raise SystemExit("hermes_lcm requires --prompt-build-max-workers 1")
     data_root = Path(args.data_root).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     runtime_dir = output_dir / "runtime_inputs"
@@ -297,7 +334,7 @@ def main() -> None:
         selected_questions=selected_questions,
         output_path=runtime_dir / "haystack.json",
     )
-    memory_config = build_memory_config(args, data_root)
+    memory_config = build_memory_config(args, data_root, output_dir)
     memory_config_path = runtime_dir / "memory_config.json"
     write_json(memory_config_path, memory_config)
 
