@@ -4,6 +4,7 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
+import hashlib
 import json
 import mimetypes
 import os
@@ -144,6 +145,14 @@ def parse_args() -> argparse.Namespace:
         help="Build and save shared memory, then exit before prompt construction",
     )
     parser.add_argument(
+        "--defer-scoring",
+        action="store_true",
+        help=(
+            "Build prompts and generate reader outputs, persist reader_stage.jsonl, "
+            "then exit before evaluator calls."
+        ),
+    )
+    parser.add_argument(
         "--load-memory-dir",
         default=None,
         help="Path to a saved memory_state directory to load instead of rebuilding from trajectories",
@@ -205,6 +214,12 @@ def utc_now_iso() -> str:
 
 def save_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def save_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as fp:
+        for record in records:
+            fp.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
 def load_json_list(path_str: str) -> list[dict[str, Any]]:
@@ -983,6 +998,45 @@ async def generate_all_reader_outputs(
     return outputs
 
 
+def build_reader_stage_record(
+    row: dict[str, Any],
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "index": row["index"],
+        "stream_index": row["stream_index"],
+        "question_id": row["question_id"],
+        "question_type": row["question_type"],
+        "category": row["category"],
+        "is_abstention_problem": row["is_abstention_problem"],
+        "eval_function": row["eval_function"],
+        "eval_name": row["eval_name"],
+        "question_item": row["question_item"],
+        "question_text": row["question_text"],
+        "question_image": row["question_image"],
+        "haystack_ids": row["haystack_ids"],
+        "memory_context": row["memory_context"],
+        "memory_query_duration_seconds": row["memory_query_duration_seconds"],
+        "memory_post_query_duration_seconds": row[
+            "memory_post_query_duration_seconds"
+        ],
+        "memory_post_query_metadata": row["memory_post_query_metadata"],
+        "memory_context_original_token_count": row[
+            "memory_context_original_token_count"
+        ],
+        "memory_context_token_count": row["memory_context_token_count"],
+        "memory_context_was_truncated": row["memory_context_was_truncated"],
+        "prompt_messages": row["prompt_messages"],
+        "answer_gold": row["answer_gold"],
+        "response_raw": output["response_raw"],
+        "response_parsed_boxed": output["response_parsed_boxed"],
+        "is_unknown": output["is_unknown"],
+        "usage": output["usage"],
+        "reader_trace": output["reader_trace"],
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
 def category_from_question_type(question_type: str) -> str:
     require(question_type in CATEGORY_MAP, f"Unexpected question_type: {question_type}")
     return CATEGORY_MAP[question_type]
@@ -1481,6 +1535,27 @@ def main() -> None:
     )
 
     outputs_by_question_id = asyncio.run(generate_all_reader_outputs(args, prompt_rows))
+
+    reader_stage_path = output_dir / "reader_stage.jsonl"
+    reader_stage_records = [
+        build_reader_stage_record(row, outputs_by_question_id[row["question_id"]])
+        for row in prompt_rows
+    ]
+    save_jsonl(reader_stage_path, reader_stage_records)
+    reader_stage_sha256 = hashlib.sha256(reader_stage_path.read_bytes()).hexdigest()
+    save_json(
+        output_dir / "reader_stage_summary.json",
+        {
+            "completed_at_utc": utc_now_iso(),
+            "record_count": len(reader_stage_records),
+            "question_ids": [record["question_id"] for record in reader_stage_records],
+            "reader_stage_path": str(reader_stage_path),
+            "reader_stage_sha256": reader_stage_sha256,
+            "scoring_deferred": bool(args.defer_scoring),
+        },
+    )
+    if args.defer_scoring:
+        return
 
     per_question_path = output_dir / "per_question.jsonl"
     records: list[dict[str, Any]] = []

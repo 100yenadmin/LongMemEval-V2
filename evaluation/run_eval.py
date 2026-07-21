@@ -116,6 +116,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-completion-tokens", type=int, default=20000)
     parser.add_argument("--memory-context-max-tokens", type=int, default=200000)
     parser.add_argument("--reader-enable-thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--defer-scoring",
+        action="store_true",
+        help="Persist fixed reader outputs and exit before official evaluator calls.",
+    )
 
     parser.add_argument("--controller-model", default=os.getenv("LME_CONTROLLER_MODEL", "Qwen/Qwen3.5-9B"))
     parser.add_argument("--controller-base-url", default=os.getenv("LME_CONTROLLER_BASE_URL", "http://localhost:8023/v1"))
@@ -430,6 +435,8 @@ def main() -> None:
     ]
     if not args.reader_enable_thinking:
         harness_argv.append("--reader-disable-thinking")
+    if args.defer_scoring:
+        harness_argv.append("--defer-scoring")
     if args.shuffle_questions_seed is not None:
         harness_argv.extend(["--shuffle-questions-seed", str(args.shuffle_questions_seed)])
     print(json.dumps({"runtime_dir": str(runtime_dir), "method": args.method}, indent=2))

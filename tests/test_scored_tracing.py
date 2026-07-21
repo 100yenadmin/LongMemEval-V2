@@ -247,3 +247,51 @@ def test_trace_aggregation_separates_model_and_deterministic_stages():
     }
     assert summary["latency_seconds"]["avg"] == 0.805
     assert summary["latency_seconds"]["max"] == 1.6
+
+
+def test_reader_stage_record_preserves_evidence_without_encoded_request_or_secret():
+    row = {
+        "index": 3,
+        "stream_index": 4,
+        "question_id": "synthetic-q",
+        "question_type": "static-environment",
+        "category": "static",
+        "is_abstention_problem": False,
+        "eval_function": "norm_phrase_set_match",
+        "eval_name": "norm_phrase_set_match",
+        "question_item": {"question": {"text": "Synthetic question"}},
+        "question_text": "Synthetic question",
+        "question_image": None,
+        "haystack_ids": ["trajectory-a"],
+        "memory_context": [{"type": "text", "value": "exact evidence"}],
+        "memory_query_duration_seconds": 0.4,
+        "memory_post_query_duration_seconds": 0.1,
+        "memory_post_query_metadata": {"exact_refs": ["trajectory-a:state:2"]},
+        "memory_context_original_token_count": 12,
+        "memory_context_token_count": 12,
+        "memory_context_was_truncated": False,
+        "prompt_messages": [{"role": "user", "content": "Synthetic question"}],
+        "answer_gold": "fixture",
+        "messages": [{"role": "user", "content": "data:image/png;base64,secretish"}],
+        "api_key": "must-not-persist",
+    }
+    output = {
+        "response_raw": "\\boxed{fixture}",
+        "response_parsed_boxed": "fixture",
+        "is_unknown": False,
+        "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+        "reader_trace": {"kind": "model", "actual_model": "Qwen/Qwen3.5-9B"},
+    }
+
+    record = harness.build_reader_stage_record(row, output)
+
+    assert record["memory_post_query_metadata"]["exact_refs"] == [
+        "trajectory-a:state:2"
+    ]
+    assert record["response_parsed_boxed"] == "fixture"
+    assert record["reader_trace"]["actual_model"] == "Qwen/Qwen3.5-9B"
+    serialized = repr(record)
+    assert "data:image/png;base64" not in serialized
+    assert "must-not-persist" not in serialized
+    assert "messages" not in record
+    assert "api_key" not in record
