@@ -54,6 +54,30 @@ def _product_api():
         ) from first_error
 
 
+def _arm_quota_from_env() -> tuple[int, int] | None:
+    """Optional D(8,3)-style per-arm quota override for the H3.1 composition
+    seam (a product's ``TrajectoryStore.query(..., arm_quota=(q_lex, q_sem))``
+    kwarg -- see session-notes/2026-07-23/hermes-benchprog-h1/artifacts/
+    H3.1-design-options.md, Option D). Read directly from the environment,
+    exactly like the query-path spend-guard's LCM_EMBEDDING_QUERY_SPEND_*
+    overrides -- never persisted into memory_params/config, so a product
+    checkout that predates the ``arm_quota`` kwarg (e.g. the h1-v2-instrument
+    control) is simply never passed it and is unaffected. Unset/empty means
+    "current bytes" (kwarg omitted from the query() call entirely, not
+    passed as None -- older products don't accept the keyword at all).
+    """
+    raw = os.environ.get("HERMES_LCM_ARM_QUOTA", "").strip()
+    if not raw:
+        return None
+    parts = raw.split(",")
+    require(len(parts) == 2, f"HERMES_LCM_ARM_QUOTA must be 'q_lex,q_sem', got {raw!r}")
+    try:
+        q_lex, q_sem = int(parts[0].strip()), int(parts[1].strip())
+    except ValueError as exc:
+        raise RuntimeError(f"HERMES_LCM_ARM_QUOTA must be two integers, got {raw!r}") from exc
+    return (q_lex, q_sem)
+
+
 def _required_text(params: dict[str, object], key: str) -> str:
     value = params.get(key)
     require(isinstance(value, str) and value.strip(), f"hermes_lcm {key} must be a non-empty string")
@@ -211,6 +235,9 @@ class HermesLCMMemory(Memory):
         # Count of best-effort telemetry writes that failed (disk full,
         # unwritable path, ...). A telemetry write must NEVER fail a question.
         self._telemetry_write_failures = 0
+        # H3.1 composition-seam override (env-var only, see
+        # _arm_quota_from_env docstring); None reproduces current bytes.
+        self._arm_quota: tuple[int, int] | None = _arm_quota_from_env()
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -435,6 +462,7 @@ class HermesLCMMemory(Memory):
                 "corpus_uid": self._store.corpus_uid,
                 "question_id": question_id,
                 "guard_config": self._guard_config_echo(),
+                "arm_quota": list(self._arm_quota) if self._arm_quota is not None else None,
                 "semantic_attempt": _call("last_semantic_attempt"),
                 "semantic_attempt_counters": _call("semantic_attempt_counters"),
                 "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
@@ -469,6 +497,7 @@ class HermesLCMMemory(Memory):
             "domain": str(self.memory_params.get("domain", "")),
             "semantic_attempt_counters": counters,
             "guard_config": self._guard_config_echo(),
+            "arm_quota": list(self._arm_quota) if self._arm_quota is not None else None,
             "telemetry_write_failures": self._telemetry_write_failures,
         }
 
@@ -526,14 +555,19 @@ class HermesLCMMemory(Memory):
         del query_image  # input-only; never persisted, traced, or returned
         self._finalize()
         started = time.perf_counter()
-        hits = self._store.query(
-            query,
-            candidate_limit=int(self.memory_params["candidate_limit"]),
-            limit=int(self.memory_params["max_text_items"]),
-            image_limit=int(self.memory_params["max_image_items"]),
-            include_adjacent=bool(self.memory_params["include_adjacent"]),
-            text_char_limit=int(self.memory_params["max_text_chars_per_item"]),
-        )
+        query_kwargs: dict[str, object] = {
+            "candidate_limit": int(self.memory_params["candidate_limit"]),
+            "limit": int(self.memory_params["max_text_items"]),
+            "image_limit": int(self.memory_params["max_image_items"]),
+            "include_adjacent": bool(self.memory_params["include_adjacent"]),
+            "text_char_limit": int(self.memory_params["max_text_chars_per_item"]),
+        }
+        if self._arm_quota is not None:
+            # Only products that implement Option D (bench/h3.1-composition
+            # and later) accept this kwarg; omitted entirely when unset so a
+            # pre-composition product checkout's query() never sees it.
+            query_kwargs["arm_quota"] = self._arm_quota
+        hits = self._store.query(query, **query_kwargs)
         context: list[MemoryContextItem] = []
         for hit in hits:
             context.append({"type": "text", "value": self._render_hit(hit)})
