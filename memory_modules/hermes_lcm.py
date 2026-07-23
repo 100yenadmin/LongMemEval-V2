@@ -99,6 +99,41 @@ def _lexical_floor_from_env() -> int:
     return floor
 
 
+def _adjacency_expansion_from_env() -> tuple[int, int] | None:
+    """Optional H5(b) adjacency pool-expansion override (a product's
+    ``TrajectoryStore.query(..., adjacency_radius=R, adjacency_quota=Q)``
+    kwargs -- the lexical-seed sequence-neighbor pool expansion of issue
+    hermes-lcm#135, SPEC-H5b). Read from the environment exactly like
+    ``_arm_quota_from_env`` -- never persisted into memory_params/config, so a
+    product checkout that predates the adjacency kwargs is simply never
+    passed them. Both ``HERMES_LCM_ADJACENCY_RADIUS`` and
+    ``HERMES_LCM_ADJACENCY_QUOTA`` must be set to positive integers to
+    activate; both unset/empty means "current bytes" (kwargs omitted from the
+    query() call entirely). Setting exactly one is a loud configuration
+    error, not a silent no-op.
+    """
+    raw_radius = os.environ.get("HERMES_LCM_ADJACENCY_RADIUS", "").strip()
+    raw_quota = os.environ.get("HERMES_LCM_ADJACENCY_QUOTA", "").strip()
+    if not raw_radius and not raw_quota:
+        return None
+    require(
+        bool(raw_radius) and bool(raw_quota),
+        "HERMES_LCM_ADJACENCY_RADIUS and HERMES_LCM_ADJACENCY_QUOTA must be "
+        f"set together, got radius={raw_radius!r} quota={raw_quota!r}",
+    )
+    try:
+        radius, quota = int(raw_radius), int(raw_quota)
+    except ValueError as exc:
+        raise RuntimeError(
+            "HERMES_LCM_ADJACENCY_RADIUS/QUOTA must be integers, got "
+            f"radius={raw_radius!r} quota={raw_quota!r}"
+        ) from exc
+    require(radius >= 0 and quota >= 0, "HERMES_LCM_ADJACENCY_* must be >= 0")
+    if radius == 0 or quota == 0:
+        return None  # explicit zero = off (kwargs omitted; current bytes)
+    return (radius, quota)
+
+
 def _required_text(params: dict[str, object], key: str) -> str:
     value = params.get(key)
     require(isinstance(value, str) and value.strip(), f"hermes_lcm {key} must be a non-empty string")
@@ -261,6 +296,9 @@ class HermesLCMMemory(Memory):
         # reproduce current bytes. Together they select the A+D hybrid.
         self._arm_quota: tuple[int, int] | None = _arm_quota_from_env()
         self._lexical_floor: int = _lexical_floor_from_env()
+        # H5(b) adjacency pool-expansion override (env-var only, see the
+        # _adjacency_expansion_from_env docstring); None reproduces current bytes.
+        self._adjacency: tuple[int, int] | None = _adjacency_expansion_from_env()
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -487,6 +525,10 @@ class HermesLCMMemory(Memory):
                 "guard_config": self._guard_config_echo(),
                 "arm_quota": list(self._arm_quota) if self._arm_quota is not None else None,
                 "lexical_floor": self._lexical_floor,
+                "adjacency_expansion": (
+                    list(self._adjacency) if self._adjacency is not None else None
+                ),
+                "adjacency_expansion_telemetry": telemetry.get("adjacency_expansion"),
                 "semantic_attempt": _call("last_semantic_attempt"),
                 "semantic_attempt_counters": _call("semantic_attempt_counters"),
                 "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
@@ -523,6 +565,9 @@ class HermesLCMMemory(Memory):
             "guard_config": self._guard_config_echo(),
             "arm_quota": list(self._arm_quota) if self._arm_quota is not None else None,
             "lexical_floor": self._lexical_floor,
+            "adjacency_expansion": (
+                list(self._adjacency) if self._adjacency is not None else None
+            ),
             "telemetry_write_failures": self._telemetry_write_failures,
         }
 
@@ -596,6 +641,12 @@ class HermesLCMMemory(Memory):
             # A+D hybrid floor; same omitted-when-unset discipline as arm_quota
             # so a pre-composition product checkout's query() never sees it.
             query_kwargs["lexical_floor"] = self._lexical_floor
+        if self._adjacency is not None:
+            # H5(b) adjacency pool-expansion (hermes-lcm#135); only products
+            # on bench/h5-recall and later accept these kwargs -- omitted
+            # entirely when unset so older checkouts never see them.
+            query_kwargs["adjacency_radius"] = self._adjacency[0]
+            query_kwargs["adjacency_quota"] = self._adjacency[1]
         hits = self._store.query(query, **query_kwargs)
         context: list[MemoryContextItem] = []
         for hit in hits:
