@@ -78,6 +78,27 @@ def _arm_quota_from_env() -> tuple[int, int] | None:
     return (q_lex, q_sem)
 
 
+def _lexical_floor_from_env() -> int:
+    """Optional Policy-A lexical-floor override for the H3.1 A+D hybrid seam (a
+    product's ``TrajectoryStore.query(..., lexical_floor=K)`` kwarg -- reserves
+    the top ``K`` pure-BM25 incumbents a nucleus slot, composed on top of the
+    ``arm_quota`` round-robin). Read from the environment exactly like
+    ``_arm_quota_from_env`` -- never persisted into memory_params/config, so a
+    product checkout that predates the ``lexical_floor`` kwarg is simply never
+    passed it. Unset/empty/``0`` means "current bytes" (kwarg omitted from the
+    query() call entirely, not passed as 0 -- older products don't accept it).
+    """
+    raw = os.environ.get("HERMES_LCM_LEXICAL_FLOOR", "").strip()
+    if not raw:
+        return 0
+    try:
+        floor = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"HERMES_LCM_LEXICAL_FLOOR must be an integer, got {raw!r}") from exc
+    require(floor >= 0, f"HERMES_LCM_LEXICAL_FLOOR must be >= 0, got {floor}")
+    return floor
+
+
 def _required_text(params: dict[str, object], key: str) -> str:
     value = params.get(key)
     require(isinstance(value, str) and value.strip(), f"hermes_lcm {key} must be a non-empty string")
@@ -235,9 +256,11 @@ class HermesLCMMemory(Memory):
         # Count of best-effort telemetry writes that failed (disk full,
         # unwritable path, ...). A telemetry write must NEVER fail a question.
         self._telemetry_write_failures = 0
-        # H3.1 composition-seam override (env-var only, see
-        # _arm_quota_from_env docstring); None reproduces current bytes.
+        # H3.1 composition-seam overrides (env-var only, see the
+        # _arm_quota_from_env / _lexical_floor_from_env docstrings); None / 0
+        # reproduce current bytes. Together they select the A+D hybrid.
         self._arm_quota: tuple[int, int] | None = _arm_quota_from_env()
+        self._lexical_floor: int = _lexical_floor_from_env()
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -463,6 +486,7 @@ class HermesLCMMemory(Memory):
                 "question_id": question_id,
                 "guard_config": self._guard_config_echo(),
                 "arm_quota": list(self._arm_quota) if self._arm_quota is not None else None,
+                "lexical_floor": self._lexical_floor,
                 "semantic_attempt": _call("last_semantic_attempt"),
                 "semantic_attempt_counters": _call("semantic_attempt_counters"),
                 "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
@@ -498,6 +522,7 @@ class HermesLCMMemory(Memory):
             "semantic_attempt_counters": counters,
             "guard_config": self._guard_config_echo(),
             "arm_quota": list(self._arm_quota) if self._arm_quota is not None else None,
+            "lexical_floor": self._lexical_floor,
             "telemetry_write_failures": self._telemetry_write_failures,
         }
 
@@ -567,6 +592,10 @@ class HermesLCMMemory(Memory):
             # and later) accept this kwarg; omitted entirely when unset so a
             # pre-composition product checkout's query() never sees it.
             query_kwargs["arm_quota"] = self._arm_quota
+        if self._lexical_floor > 0:
+            # A+D hybrid floor; same omitted-when-unset discipline as arm_quota
+            # so a pre-composition product checkout's query() never sees it.
+            query_kwargs["lexical_floor"] = self._lexical_floor
         hits = self._store.query(query, **query_kwargs)
         context: list[MemoryContextItem] = []
         for hit in hits:
