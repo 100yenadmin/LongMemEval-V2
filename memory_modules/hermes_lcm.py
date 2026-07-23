@@ -204,6 +204,10 @@ class HermesLCMMemory(Memory):
         self._semantic_setup_fallbacks = 0
         self.last_query_latency_seconds = 0.0
         self.read_only = False
+        # Runtime-only side-channel trace root (never persisted into memory
+        # config, so save/load config equality -- and thus run isolation --
+        # is unchanged). Delivered by the harness via configure_runtime.
+        self._query_trace_dir: Path | None = None
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -367,6 +371,108 @@ class HermesLCMMemory(Memory):
                 self._semantic_setup_fallbacks = 1
             self._semantic_ready = True
 
+    def configure_runtime(self, **kwargs: object) -> None:
+        """Apply non-persisted runtime overrides (harness-supplied trace root).
+
+        ``query_trace_dir`` is the run-root side-channel directory where the
+        harness collects per-question artifacts. It is runtime-only and never
+        enters saved memory config, so it cannot perturb run isolation or the
+        reader prompt bytes.
+        """
+        query_trace_dir = kwargs.get("query_trace_dir")
+        if query_trace_dir is not None:
+            if isinstance(query_trace_dir, Path):
+                self._query_trace_dir = query_trace_dir.resolve()
+            else:
+                require(
+                    isinstance(query_trace_dir, str) and query_trace_dir.strip(),
+                    "hermes_lcm query_trace_dir override must be a non-empty string or Path",
+                )
+                self._query_trace_dir = Path(query_trace_dir).resolve()
+
+    def _guard_config_echo(self) -> dict[str, object] | None:
+        """Echo the resolved query-path spend-guard for run summaries (#123)."""
+        provider = getattr(self._store, "embedding_provider", None) if self._store else None
+        guard = getattr(provider, "spend_guard", None)
+        if guard is None:
+            return None
+        return {
+            "max_calls": getattr(guard, "max_calls", None),
+            "window_seconds": getattr(guard, "window_seconds", None),
+            "backoff_seconds": getattr(guard, "backoff_seconds", None),
+        }
+
+    def _write_query_trace(self, exact_refs: list[str]) -> None:
+        """Persist the per-query semantic telemetry as a run-root side-channel
+        file (#124 e). Written strictly AFTER the product ``query()`` returns
+        and never touches the returned evidence or the post-query metadata, so
+        reader prompt bytes stay byte-identical to baseline. Product methods are
+        read defensively so an older product simply yields a null-populated
+        record instead of raising."""
+        if self._query_trace_dir is None or self._store is None:
+            return
+        context = self.get_query_context()
+        question_id = context.get("question_id")
+        if not isinstance(question_id, str) or not question_id:
+            return
+
+        def _call(name: str):
+            fn = getattr(self._store, name, None)
+            return fn() if callable(fn) else None
+
+        telemetry = _call("last_query_telemetry") or {}
+        record = {
+            "backend": self.memory_type,
+            "corpus_uid": self._store.corpus_uid,
+            "question_id": question_id,
+            "guard_config": self._guard_config_echo(),
+            "semantic_attempt": _call("last_semantic_attempt"),
+            "semantic_attempt_counters": _call("semantic_attempt_counters"),
+            "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
+            "state_candidate_pool": telemetry.get("state_candidate_pool", []),
+            "delivered_evidence_refs": telemetry.get(
+                "delivered_evidence_refs", list(exact_refs)
+            ),
+        }
+        out_dir = self._query_trace_dir / question_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "hermes_lcm_semantic_telemetry.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def run_summary(self) -> dict[str, object]:
+        """Aggregate semantic-funnel counters + guard echo for the run (#124 f)."""
+        counters: dict[str, object] | None = None
+        if self._store is not None:
+            fn = getattr(self._store, "semantic_attempt_counters", None)
+            if callable(fn):
+                counters = fn()
+        return {
+            "backend": self.memory_type,
+            "domain": str(self.memory_params.get("domain", "")),
+            "semantic_attempt_counters": counters,
+            "guard_config": self._guard_config_echo(),
+        }
+
+    def emit_run_summary(self) -> dict[str, object]:
+        """Print one loud, unmissable run-summary line and return the payload."""
+        summary = self.run_summary()
+        counters = summary.get("semantic_attempt_counters") or {}
+        guard = summary.get("guard_config") or {}
+        print(
+            "[hermes_lcm run-summary] "
+            f"domain={summary['domain']} "
+            f"semantic_attempts={counters.get('successes', 0)}/{counters.get('attempts', 0)} "
+            f"fallbacks={counters.get('fallbacks', 0)} "
+            f"by_reason={counters.get('fallbacks_by_reason', {})} "
+            f"guard(max_calls={guard.get('max_calls')},"
+            f"window_s={guard.get('window_seconds')},"
+            f"backoff_s={guard.get('backoff_seconds')})",
+            flush=True,
+        )
+        return summary
+
     @staticmethod
     def _render_hit(hit) -> str:
         lines = [
@@ -441,6 +547,10 @@ class HermesLCMMemory(Memory):
                 + semantic_metrics["query_calls"]
             ),
         }
+        # Side-channel telemetry only: does not mutate `context` (reader prompt
+        # bytes) or `_last_query_metadata` (post-query metadata stays
+        # deterministic across identical queries).
+        self._write_query_trace([hit.exact_ref for hit in hits])
         return context
 
     def post_query_hook(
@@ -490,5 +600,10 @@ class HermesLCMMemory(Memory):
 
     def close(self) -> None:
         if self._store is not None:
+            # Emit the loud run summary only for a process that actually served
+            # queries (the reader stage), so the build process stays quiet.
+            counters = self.run_summary().get("semantic_attempt_counters") or {}
+            if counters.get("attempts", 0):
+                self.emit_run_summary()
             self._store.close()
             self._store = None

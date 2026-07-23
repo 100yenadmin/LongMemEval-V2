@@ -513,3 +513,86 @@ def test_load_accepts_legacy_manifest_without_optional_semantic_index(
         assert restored.query("storage quota")
     finally:
         restored.close()
+
+
+def _build_semantic_memory(tmp_path: Path, monkeypatch, data_root: Path):
+    memory = build_memory(_semantic_config(tmp_path, data_root))
+    monkeypatch.setattr(
+        memory._api,
+        "create_trajectory_embedding_provider",
+        lambda *_args, **_kwargs: _FakeTrajectoryProvider(),
+    )
+    memory.insert(_trajectory(data_root))
+    return memory
+
+
+def test_semantic_telemetry_is_side_channel_and_rendering_byte_identical(
+    tmp_path: Path,
+    monkeypatch,
+):
+    # Isolation contract (#124): enabling the query_trace_dir side channel must
+    # not change the reader prompt bytes (rendered evidence) or the post-query
+    # metadata for any query, while writing a per-question telemetry file.
+    # Two fresh, identically-built memories keep the cumulative store counters
+    # aligned per query position so any perturbation would show up.
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    baseline = _build_semantic_memory(tmp_path / "a", monkeypatch, data_root)
+    instrumented = _build_semantic_memory(tmp_path / "b", monkeypatch, data_root)
+    trace_dir = tmp_path / "query_traces"
+    instrumented.configure_runtime(query_trace_dir=trace_dir)
+    questions = [
+        "Why did export fail?",
+        "storage quota retrying",
+        "Open storage settings before retrying",
+    ]
+    try:
+        for index, question in enumerate(questions):
+            base_ctx = baseline.query(question)
+            base_meta = baseline.post_query_hook(
+                query=question, query_image=None, memory_context=base_ctx
+            )
+
+            qid = f"question-{index}"
+            instrumented.set_query_context(
+                question_id=qid, question_type="t", question_item={}
+            )
+            try:
+                inst_ctx = instrumented.query(question)
+                inst_meta = instrumented.post_query_hook(
+                    query=question, query_image=None, memory_context=inst_ctx
+                )
+            finally:
+                instrumented.clear_query_context()
+
+            # Byte-identical rendered evidence AND unchanged post-query metadata.
+            assert inst_ctx == base_ctx
+            assert inst_meta == base_meta
+
+            # Side-channel telemetry file written with the documented schema.
+            trace_path = trace_dir / qid / "hermes_lcm_semantic_telemetry.json"
+            assert trace_path.is_file()
+            record = json.loads(trace_path.read_text(encoding="utf-8"))
+            assert record["question_id"] == qid
+            assert record["delivered_evidence_refs"] == [
+                item["value"].split("[", 1)[-1].split("]", 1)[0]
+                for item in inst_ctx
+                if item["type"] == "text"
+            ]
+            # attempt/ranks present when the product exposes the instrument.
+            if record["semantic_attempt"] is not None:
+                assert record["semantic_attempt"]["outcome"] == "success"
+                assert record["source_candidate_ranks"]
+                assert record["state_candidate_pool"]
+                counters = record["semantic_attempt_counters"]
+                assert counters["successes"] >= 1
+                assert counters["fallbacks"] == 0
+
+        assert sorted(p.name for p in trace_dir.iterdir()) == [
+            "question-0",
+            "question-1",
+            "question-2",
+        ]
+    finally:
+        baseline.close()
+        instrumented.close()
