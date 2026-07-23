@@ -246,6 +246,36 @@ Submit leaderboard packages through the
 leaderboard entries as GitHub issues. Informal submission issues will be closed
 or deleted.
 
+## Hermes-LCM semantic telemetry (side-channel)
+
+When the `hermes_lcm` memory backend runs with a harness `query_trace_dir`
+(`<run_root>/query_traces/`), it writes one per-question instrument file,
+`query_traces/<question_id>/hermes_lcm_semantic_telemetry.json`, **after** the
+product `query()` returns. It is strictly side-channel: it never alters the
+returned evidence (reader-prompt bytes) or the deterministic
+`memory_post_query_metadata`, and `query_trace_dir` is runtime-only (never part
+of saved memory config), so run isolation is preserved. Evaluator ground truth
+never enters product/runtime inputs — the record is derived only from the
+product's own post-call telemetry.
+
+Schema (`hermes_lcm_semantic_telemetry.json`):
+
+| field | type | meaning |
+|---|---|---|
+| `backend` | str | always `"hermes_lcm"` |
+| `corpus_uid` | str | the queried corpus identity |
+| `question_id` | str | harness question id (not ground truth) |
+| `guard_config` | object \| null | resolved query-path spend guard: `max_calls`, `window_seconds`, `backoff_seconds` |
+| `semantic_attempt` | object \| null | typed attempt record: `provider`, `model`, `outcome` (`success`\|`fallback`), `exception_class`, `http_status`, `retry_after`, `latency_ms`, `reason` |
+| `semantic_attempt_counters` | object \| null | run-cumulative `attempts`, `successes`, `fallbacks`, `fallbacks_by_reason` |
+| `source_candidate_ranks` | list | ranked source candidates (top ≤64): `source_id`, `rank`, `score` |
+| `state_candidate_pool` | list | pre-selection state pool (top ≤64): `state_id`, `rank`, `score` |
+| `delivered_evidence_refs` | list[str] | exact refs of the evidence actually delivered |
+
+At the end of a query-serving process the backend prints one loud run-summary
+line: `[hermes_lcm run-summary] domain=… semantic_attempts=S/N fallbacks=F
+by_reason={…} guard(max_calls=…,window_s=…,backoff_s=…)`.
+
 ## Citation
 
 
