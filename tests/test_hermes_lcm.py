@@ -596,3 +596,48 @@ def test_semantic_telemetry_is_side_channel_and_rendering_byte_identical(
     finally:
         baseline.close()
         instrumented.close()
+
+
+@pytest.mark.parametrize("mode", ["trace_dir_is_a_file", "trace_dir_is_read_only"])
+def test_telemetry_write_failure_never_fails_the_question(
+    tmp_path: Path,
+    monkeypatch,
+    mode: str,
+):
+    # A1 regression: _write_query_trace runs inside query() before it returns,
+    # so an unwritable query_trace_dir must degrade to a counted, logged warning
+    # -- the question must still return byte-identical evidence.
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    baseline = _build_semantic_memory(tmp_path / "a", monkeypatch, data_root)
+    victim = _build_semantic_memory(tmp_path / "b", monkeypatch, data_root)
+
+    if mode == "trace_dir_is_a_file":
+        bad = tmp_path / "trace_is_file"
+        bad.write_text("not a directory", encoding="utf-8")
+    else:
+        bad = tmp_path / "trace_ro"
+        bad.mkdir()
+        os.chmod(bad, 0o500)  # read+execute, no write
+    victim.configure_runtime(query_trace_dir=bad)
+
+    questions = ["Why did export fail?", "storage quota", "Open storage settings"]
+    try:
+        for index, question in enumerate(questions):
+            base_ctx = baseline.query(question)
+            victim.set_query_context(
+                question_id=f"q-{index}", question_type="t", question_item={}
+            )
+            try:
+                victim_ctx = victim.query(question)  # must NOT raise
+            finally:
+                victim.clear_query_context()
+            assert victim_ctx == base_ctx  # byte-identical evidence preserved
+
+        summary = victim.run_summary()
+        assert summary["telemetry_write_failures"] == len(questions)
+    finally:
+        if mode == "trace_dir_is_read_only":
+            os.chmod(bad, 0o700)  # restore so tmp cleanup can remove it
+        baseline.close()
+        victim.close()

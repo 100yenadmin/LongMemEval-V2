@@ -208,6 +208,9 @@ class HermesLCMMemory(Memory):
         # config, so save/load config equality -- and thus run isolation --
         # is unchanged). Delivered by the harness via configure_runtime.
         self._query_trace_dir: Path | None = None
+        # Count of best-effort telemetry writes that failed (disk full,
+        # unwritable path, ...). A telemetry write must NEVER fail a question.
+        self._telemetry_write_failures = 0
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -408,38 +411,51 @@ class HermesLCMMemory(Memory):
         and never touches the returned evidence or the post-query metadata, so
         reader prompt bytes stay byte-identical to baseline. Product methods are
         read defensively so an older product simply yields a null-populated
-        record instead of raising."""
+        record instead of raising.
+
+        The ENTIRE body is fenced: this runs inside ``query()`` before the
+        question returns, so any I/O failure (disk full, unwritable dir, a file
+        where a directory is expected) must degrade to a counted, logged warning
+        -- never fail the question."""
         if self._query_trace_dir is None or self._store is None:
             return
-        context = self.get_query_context()
-        question_id = context.get("question_id")
-        if not isinstance(question_id, str) or not question_id:
-            return
+        try:
+            context = self.get_query_context()
+            question_id = context.get("question_id")
+            if not isinstance(question_id, str) or not question_id:
+                return
 
-        def _call(name: str):
-            fn = getattr(self._store, name, None)
-            return fn() if callable(fn) else None
+            def _call(name: str):
+                fn = getattr(self._store, name, None)
+                return fn() if callable(fn) else None
 
-        telemetry = _call("last_query_telemetry") or {}
-        record = {
-            "backend": self.memory_type,
-            "corpus_uid": self._store.corpus_uid,
-            "question_id": question_id,
-            "guard_config": self._guard_config_echo(),
-            "semantic_attempt": _call("last_semantic_attempt"),
-            "semantic_attempt_counters": _call("semantic_attempt_counters"),
-            "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
-            "state_candidate_pool": telemetry.get("state_candidate_pool", []),
-            "delivered_evidence_refs": telemetry.get(
-                "delivered_evidence_refs", list(exact_refs)
-            ),
-        }
-        out_dir = self._query_trace_dir / question_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "hermes_lcm_semantic_telemetry.json").write_text(
-            json.dumps(record, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
+            telemetry = _call("last_query_telemetry") or {}
+            record = {
+                "backend": self.memory_type,
+                "corpus_uid": self._store.corpus_uid,
+                "question_id": question_id,
+                "guard_config": self._guard_config_echo(),
+                "semantic_attempt": _call("last_semantic_attempt"),
+                "semantic_attempt_counters": _call("semantic_attempt_counters"),
+                "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
+                "state_candidate_pool": telemetry.get("state_candidate_pool", []),
+                "delivered_evidence_refs": telemetry.get(
+                    "delivered_evidence_refs", list(exact_refs)
+                ),
+            }
+            out_dir = self._query_trace_dir / question_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "hermes_lcm_semantic_telemetry.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry must never fail a query
+            self._telemetry_write_failures += 1
+            print(
+                f"[hermes_lcm] telemetry write skipped ({type(exc).__name__}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def run_summary(self) -> dict[str, object]:
         """Aggregate semantic-funnel counters + guard echo for the run (#124 f)."""
@@ -453,6 +469,7 @@ class HermesLCMMemory(Memory):
             "domain": str(self.memory_params.get("domain", "")),
             "semantic_attempt_counters": counters,
             "guard_config": self._guard_config_echo(),
+            "telemetry_write_failures": self._telemetry_write_failures,
         }
 
     def emit_run_summary(self) -> dict[str, object]:
@@ -466,6 +483,7 @@ class HermesLCMMemory(Memory):
             f"semantic_attempts={counters.get('successes', 0)}/{counters.get('attempts', 0)} "
             f"fallbacks={counters.get('fallbacks', 0)} "
             f"by_reason={counters.get('fallbacks_by_reason', {})} "
+            f"telemetry_write_failures={summary['telemetry_write_failures']} "
             f"guard(max_calls={guard.get('max_calls')},"
             f"window_s={guard.get('window_seconds')},"
             f"backoff_s={guard.get('backoff_seconds')})",
