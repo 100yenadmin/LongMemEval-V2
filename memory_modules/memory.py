@@ -223,3 +223,4 @@ from .agentrunbook_c_v2 import AgentRunbookCV2  # noqa: E402,F401
 from .agentrunbook_r import AgentRunbookR  # noqa: E402,F401
 from .rag import RagMemory  # noqa: E402,F401
 from .hermes_lcm import HermesLCMMemory  # noqa: E402,F401
+from .hermes_lcm_agentic import HermesLCMAgenticMemory  # noqa: E402,F401

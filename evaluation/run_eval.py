@@ -27,9 +27,15 @@ METHODS = {
     "agentrunbook_c",
     "agentrunbook_c_v2",
     "hermes_lcm",
+    "hermes_lcm_agentic",
 }
 
 OFFICIAL_HARNESS_COMMIT = "6f020ac2fc3275e46c706d3406e02c3ed79b7be2"
+DEFAULT_HERMES_AGENTIC_STORE_ROOT = (
+    "/Volumes/LEXAR/Codex/benchmarks/longmemeval-v2/runs/"
+    "bench-h1-v2clean-2026-07-23/memory"
+)
+DEFAULT_HERMES_PRODUCT_ROOT = "/Volumes/LEXAR/hermes-work/hermes-lcm"
 
 OPENAI_SDK_TIMEOUT_SECONDS_BY_REASONING_EFFORT = {
     "low": 200.0,
@@ -104,6 +110,19 @@ def parse_args() -> argparse.Namespace:
         "--hermes-semantic-query-timeout-seconds",
         type=float,
         default=float(os.getenv("HERMES_LCM_SEMANTIC_QUERY_TIMEOUT_SECONDS", "5")),
+    )
+    parser.add_argument(
+        "--hermes-agentic-store-root",
+        default=os.getenv(
+            "HERMES_LCM_AGENTIC_STORE_ROOT",
+            DEFAULT_HERMES_AGENTIC_STORE_ROOT,
+        ),
+        help="Root containing canonical read-only {web,enterprise}/lcm.db stores.",
+    )
+    parser.add_argument(
+        "--hermes-agentic-product-root",
+        default=os.getenv("HERMES_LCM_PRODUCT_ROOT", DEFAULT_HERMES_PRODUCT_ROOT),
+        help="Hermes-LCM source checkout used only for the query embedding provider.",
     )
 
     parser.add_argument("--reader-model", default=os.getenv("READER_MODEL", "Qwen/Qwen3.5-9B"))
@@ -310,6 +329,91 @@ def build_memory_config(
                 "semantic_query_timeout_seconds": float(
                     getattr(args, "hermes_semantic_query_timeout_seconds", 5.0)
                 ),
+            },
+        }
+    if args.method == "hermes_lcm_agentic":
+        store_dir = (
+            Path(args.hermes_agentic_store_root).expanduser().resolve()
+            / args.domain
+        )
+        canonical_store_path = store_dir / "lcm.db"
+        canonical_config_path = store_dir / "memory_config.json"
+        if not canonical_store_path.is_file():
+            raise ValueError(
+                "Canonical Hermes-LCM agentic store is missing: "
+                f"{canonical_store_path}"
+            )
+        if not canonical_config_path.is_file():
+            raise ValueError(
+                "Canonical Hermes-LCM memory config is missing: "
+                f"{canonical_config_path}"
+            )
+        canonical_config = json.loads(
+            canonical_config_path.read_text(encoding="utf-8")
+        )
+        if (
+            not isinstance(canonical_config, dict)
+            or canonical_config.get("memory_type") != "hermes_lcm"
+            or not isinstance(canonical_config.get("memory_params"), dict)
+        ):
+            raise ValueError(
+                f"Invalid canonical Hermes-LCM config: {canonical_config_path}"
+            )
+        canonical_params = dict(canonical_config["memory_params"])
+        if canonical_params.get("domain") != args.domain:
+            raise ValueError(
+                "Canonical Hermes-LCM config domain does not match requested "
+                f"domain: {canonical_params.get('domain')!r} vs {args.domain!r}"
+            )
+        codex_params = {
+            "binary": args.codex_binary,
+            "model": args.codex_model,
+            "reasoning_effort": args.codex_reasoning_effort,
+            "timeout_seconds": args.codex_timeout_seconds,
+            "max_retries": args.codex_max_retries,
+            "extra_config": [],
+            "extra_args": [],
+        }
+        return {
+            "memory_type": "hermes_lcm_agentic",
+            "memory_params": {
+                "questions_path": str((data_root / "questions.jsonl").resolve()),
+                "evidence_mode": "both",
+                "canonical_store_path": str(canonical_store_path),
+                "asset_root": str(
+                    Path(str(canonical_params["trajectories_root_dir"]))
+                    .expanduser()
+                    .resolve()
+                ),
+                "product_root": str(
+                    Path(args.hermes_agentic_product_root)
+                    .expanduser()
+                    .resolve()
+                ),
+                "retrieval_params": {
+                    "candidate_limit": int(canonical_params["candidate_limit"]),
+                    "limit": int(canonical_params["max_text_items"]),
+                    "text_char_limit": int(
+                        canonical_params["max_text_chars_per_item"]
+                    ),
+                    "include_adjacent": bool(
+                        canonical_params["include_adjacent"]
+                    ),
+                    "semantic_enabled": bool(
+                        canonical_params["semantic_enabled"]
+                    ),
+                    "semantic_provider": str(
+                        canonical_params["semantic_provider"]
+                    ),
+                    "semantic_model": str(canonical_params["semantic_model"]),
+                    "semantic_top_trajectories": int(
+                        canonical_params["semantic_top_trajectories"]
+                    ),
+                    "semantic_query_timeout_seconds": float(
+                        canonical_params["semantic_query_timeout_seconds"]
+                    ),
+                },
+                "codex_params": codex_params,
             },
         }
     codex_params = {

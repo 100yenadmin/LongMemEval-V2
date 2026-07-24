@@ -63,6 +63,7 @@ OPENAI_MAX_RETRIES = 10
 MEMORY_CONTEXT_PROCESSOR_LOCAL = threading.local()
 NONSHARED_PARALLEL_MEMORY_TYPES = {
     "codex",
+    "hermes_lcm_agentic",
     "agentrunbook_c",
     "agentrunbook_c_v2",
     "agentrunbook_r",
@@ -288,6 +289,7 @@ def inject_runtime_memory_params(
         "rag",
         "agentrunbook_r",
         "codex",
+        "hermes_lcm_agentic",
         "agentrunbook_c",
         "agentrunbook_c_v2",
     }:
@@ -297,7 +299,12 @@ def inject_runtime_memory_params(
     runtime_config["memory_params"]["trajectories_root_dir"] = str(
         Path(trajectories_path).resolve().parent
     )
-    if runtime_config["memory_type"] in {"codex", "agentrunbook_c", "agentrunbook_c_v2"} and query_trace_dir is not None:
+    if runtime_config["memory_type"] in {
+        "codex",
+        "hermes_lcm_agentic",
+        "agentrunbook_c",
+        "agentrunbook_c_v2",
+    } and query_trace_dir is not None:
         runtime_config["memory_params"]["query_trace_dir"] = str(query_trace_dir.resolve())
     if runtime_config["memory_type"] == "agent_runbook":
         generation_params_obj = runtime_config["memory_params"].get("generation_params", {})
@@ -1256,6 +1263,7 @@ def main() -> None:
             "rag",
             "agentrunbook_r",
             "codex",
+            "hermes_lcm_agentic",
             "agentrunbook_c",
             "agentrunbook_c_v2",
         }:
@@ -1382,7 +1390,8 @@ def main() -> None:
                 supports_nonshared_parallel,
                 (
                     "--prompt-build-max-workers > 1 with non-shared haystacks is only "
-                    "supported for rag, agentrunbook_r, codex, agentrunbook_c, and agentrunbook_c_v2"
+                    "supported for rag, agentrunbook_r, codex, "
+                    "hermes_lcm_agentic, agentrunbook_c, and agentrunbook_c_v2"
                 ),
             )
         require(not args.save_memory, "--save-memory is only supported when all questions share the same ordered haystack")

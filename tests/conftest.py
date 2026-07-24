@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
 # Stub only those sibling modules so the registry contract can be tested
 # without pulling a model/provider dependency into this slice.
 for module_name, class_name in {
-    "memory_modules.codex": "CodexMemory",
     "memory_modules.agentrunbook_c": "AgentRunbookC",
     "memory_modules.agentrunbook_c_v2": "AgentRunbookCV2",
     "memory_modules.agentrunbook_r": "AgentRunbookR",
