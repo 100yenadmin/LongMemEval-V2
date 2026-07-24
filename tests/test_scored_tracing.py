@@ -1,6 +1,9 @@
 import asyncio
+import json
 from argparse import Namespace
 from types import SimpleNamespace
+
+import pytest
 
 from evaluation import harness, qa_eval_metrics
 
@@ -87,6 +90,94 @@ def test_reader_trace_records_actual_transport_without_messages_or_secrets():
     assert "synthetic fixture" not in serialized
     assert "api_key" not in serialized
     assert "messages" not in trace
+
+
+def _reader_args():
+    return Namespace(
+        model="Qwen/Qwen3.5-9B",
+        base_url="http://127.0.0.1:8023/v1",
+        api_key_env="OPENAI_API_KEY",
+        api_key_file=None,
+        max_completion_tokens=20000,
+        reasoning_effort=None,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        repetition_penalty=None,
+        presence_penalty=None,
+        reader_enable_thinking=True,
+        timeout_seconds=30.0,
+        reader_max_concurrent_requests=1,
+    )
+
+
+def test_call_reader_model_async_raises_typed_error_on_missing_choices():
+    # HTTP 200 with no choices (e.g. an OpenRouter provider-side error payload
+    # delivered inline). Must raise a typed error, never an uncaught TypeError
+    # from response.choices[0].
+    response = SimpleNamespace(
+        id="resp-fixture",
+        model="Qwen/Qwen3.5-9B",
+        provider="some-provider",
+        error={"message": "upstream provider error"},
+        choices=None,
+    )
+    completions = _AsyncCompletions(response)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    with pytest.raises(harness.ReaderNoChoicesError):
+        asyncio.run(
+            harness.call_reader_model_async(
+                client,
+                _reader_args(),
+                [{"role": "user", "content": "synthetic fixture"}],
+            )
+        )
+
+
+class _RaisingCompletions:
+    """Async completions stub that always raises json.JSONDecodeError to simulate
+    a truncated/malformed provider response body the SDK cannot parse."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def create(self, **request):
+        self.calls += 1
+        raise json.JSONDecodeError("Expecting value", "", 9911)
+
+
+def test_generate_all_reader_outputs_retries_and_survives_malformed_body(monkeypatch):
+    # A persistently malformed body must engage the bounded retry then fall
+    # through to the mark-failed-and-continue path — no uncaught TypeError or
+    # JSONDecodeError may escape and wedge the whole run.
+    completions = _RaisingCompletions()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+        close=_noop_async_close,
+    )
+    monkeypatch.setattr(harness, "create_async_client", lambda *_a, **_k: client)
+    monkeypatch.setattr(harness, "READER_MALFORMED_BODY_RETRY_BACKOFF_SECONDS", 0.0)
+
+    rows = [
+        {
+            "question_id": "synthetic-malformed-q",
+            "messages": [{"role": "user", "content": "synthetic fixture"}],
+        }
+    ]
+
+    outputs = asyncio.run(harness.generate_all_reader_outputs(_reader_args(), rows))
+
+    # Retry engaged the full bound before giving up.
+    assert completions.calls == harness.READER_MALFORMED_BODY_MAX_RETRIES
+    output = outputs["synthetic-malformed-q"]
+    assert output["response_raw"] == ""
+    assert output["reader_trace"]["kind"] == "model_error"
+    assert output["reader_trace"]["error_type"] == "ReaderMalformedBodyError"
+
+
+async def _noop_async_close():
+    return None
 
 
 def test_judge_trace_records_raw_result_usage_and_latency():

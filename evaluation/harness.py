@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from openai import AsyncOpenAI, BadRequestError
+from openai import APIError, AsyncOpenAI
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -912,6 +912,22 @@ def extract_usage_dict(response: Any) -> dict[str, int]:
     }
 
 
+class ReaderNoChoicesError(RuntimeError):
+    """Raised when an OpenAI-compatible endpoint returns HTTP 200 with no choices
+    (e.g. an OpenRouter provider-side error payload delivered inline)."""
+
+
+class ReaderMalformedBodyError(RuntimeError):
+    """Raised when an OpenAI-compatible endpoint returns a truncated/malformed
+    (non-JSON) response body that the SDK cannot parse (e.g. OpenRouter gateway
+    cutting the stream mid-payload). Not retried by the SDK's own max_retries
+    because the HTTP transport layer considers the request already complete."""
+
+
+READER_MALFORMED_BODY_MAX_RETRIES = 3
+READER_MALFORMED_BODY_RETRY_BACKOFF_SECONDS = 2.0
+
+
 async def call_reader_model_async(
     client: AsyncOpenAI,
     args: argparse.Namespace,
@@ -920,6 +936,17 @@ async def call_reader_model_async(
     started_at = time.perf_counter()
     response = await client.chat.completions.create(**build_reader_request(args, messages))
     latency_seconds = time.perf_counter() - started_at
+    if not getattr(response, "choices", None):
+        error_payload = getattr(response, "error", None)
+        if error_payload is None:
+            try:
+                error_payload = response.model_dump().get("error")
+            except Exception:  # noqa: BLE001 - best-effort error extraction from a malformed body
+                error_payload = None
+        raise ReaderNoChoicesError(
+            f"provider={getattr(response, 'provider', '')!r} "
+            f"model={getattr(response, 'model', '')!r} error={error_payload!r}"
+        )
     text = extract_text_from_response_message(response.choices[0].message)
     require(text != "", "Model returned empty text")
     usage = extract_usage_dict(response)
@@ -958,13 +985,35 @@ async def generate_all_reader_outputs(
     client = create_async_client(args.base_url, args.api_key_env, args.api_key_file)
     semaphore = asyncio.Semaphore(args.reader_max_concurrent_requests)
 
+    async def call_reader_model_with_malformed_body_retry(
+        row: dict[str, Any],
+    ) -> tuple[str, dict[str, int], dict[str, Any]]:
+        last_exc: json.JSONDecodeError | None = None
+        for attempt in range(1, READER_MALFORMED_BODY_MAX_RETRIES + 1):
+            try:
+                return await call_reader_model_async(client, args, row["messages"])
+            except json.JSONDecodeError as exc:
+                last_exc = exc
+                print(
+                    f"Malformed response body for question_id={row['question_id']} "
+                    f"(attempt {attempt}/{READER_MALFORMED_BODY_MAX_RETRIES}): {exc}. "
+                    "Retrying." if attempt < READER_MALFORMED_BODY_MAX_RETRIES else "Giving up.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if attempt < READER_MALFORMED_BODY_MAX_RETRIES:
+                    await asyncio.sleep(READER_MALFORMED_BODY_RETRY_BACKOFF_SECONDS * attempt)
+        raise ReaderMalformedBodyError(
+            f"Exhausted {READER_MALFORMED_BODY_MAX_RETRIES} retries on malformed response body: {last_exc}"
+        ) from last_exc
+
     async def run_one(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         async with semaphore:
             try:
-                response_raw, usage, reader_trace = await call_reader_model_async(
-                    client, args, row["messages"]
+                response_raw, usage, reader_trace = await call_reader_model_with_malformed_body_retry(
+                    row
                 )
-            except BadRequestError as exc:
+            except (APIError, ReaderNoChoicesError, ReaderMalformedBodyError) as exc:
                 print(
                     f"Reader request failed for question_id={row['question_id']}: {exc}. "
                     "Using empty response and continuing.",
