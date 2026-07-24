@@ -70,6 +70,12 @@ def parse_question_ids(raw_values: list[str] | None) -> list[str] | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run LongMemEval-V2 evaluation.")
+    sharp_budget_raw = os.getenv("HERMES_LCM_SHARP_TOKEN_BUDGET", "").strip()
+    sharp_context_default = (
+        int(sharp_budget_raw)
+        if sharp_budget_raw and int(sharp_budget_raw) > 0
+        else 200000
+    )
     parser.add_argument("--data-root", required=True, help="Path to the downloaded LongMemEval-V2 dataset")
     parser.add_argument("--domain", choices=["web", "enterprise"], required=True)
     parser.add_argument("--tier", choices=["small", "medium"], default="small")
@@ -133,7 +139,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-top-k", type=int, default=int(os.getenv("READER_TOP_K", "20")))
     parser.add_argument("--reader-max-concurrent-requests", type=int, default=16)
     parser.add_argument("--max-completion-tokens", type=int, default=20000)
-    parser.add_argument("--memory-context-max-tokens", type=int, default=200000)
+    parser.add_argument(
+        "--memory-context-max-tokens",
+        type=int,
+        default=sharp_context_default,
+    )
     parser.add_argument("--reader-enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--defer-scoring",

@@ -598,6 +598,92 @@ def test_semantic_telemetry_is_side_channel_and_rendering_byte_identical(
         instrumented.close()
 
 
+def test_w3b_env_passthroughs_are_runtime_only_and_echoed(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_LCM_DIVERSITY_CAP", "2")
+    monkeypatch.setenv("HERMES_LCM_ADAPTIVE_EXCERPT", "true")
+    monkeypatch.setenv("HERMES_LCM_SHARP_TOKEN_BUDGET", "900")
+    _data_root, memory = _built_memory(tmp_path)
+    captured: list[dict[str, object]] = []
+    try:
+        memory._finalize()
+        original_query = memory._store.query
+
+        def capture(query, **kwargs):
+            captured.append(dict(kwargs))
+            return original_query(query, **kwargs)
+
+        monkeypatch.setattr(memory._store, "query", capture)
+        assert memory.query("Why did export fail?")
+        assert captured[-1]["diversity_cap"] == 2
+        assert captured[-1]["adaptive_excerpt"] is True
+        assert captured[-1]["sharp_token_budget"] == 900
+        assert not {
+            "diversity_cap",
+            "adaptive_excerpt",
+            "sharp_token_budget",
+        } & set(memory.memory_params)
+        summary = memory.run_summary()
+        assert summary["diversity_cap"] == 2
+        assert summary["adaptive_excerpt"] is True
+        assert summary["sharp_token_budget"] == 900
+    finally:
+        memory.close()
+
+
+def test_w3b_env_passthroughs_are_omitted_when_unset(
+    tmp_path: Path,
+    monkeypatch,
+):
+    for name in (
+        "HERMES_LCM_DIVERSITY_CAP",
+        "HERMES_LCM_ADAPTIVE_EXCERPT",
+        "HERMES_LCM_SHARP_TOKEN_BUDGET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _data_root, memory = _built_memory(tmp_path)
+    captured: list[dict[str, object]] = []
+    try:
+        memory._finalize()
+        original_query = memory._store.query
+
+        def capture(query, **kwargs):
+            captured.append(dict(kwargs))
+            return original_query(query, **kwargs)
+
+        monkeypatch.setattr(memory._store, "query", capture)
+        assert memory.query("Why did export fail?")
+        assert "diversity_cap" not in captured[-1]
+        assert "adaptive_excerpt" not in captured[-1]
+        assert "sharp_token_budget" not in captured[-1]
+    finally:
+        memory.close()
+
+
+def test_w3b_sharp_budget_sets_exact_harness_context_default(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_LCM_SHARP_TOKEN_BUDGET", "4000")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval",
+            "--data-root",
+            "/unused",
+            "--domain",
+            "web",
+            "--method",
+            "hermes_lcm",
+            "--output-dir",
+            "/unused-output",
+        ],
+    )
+    assert run_eval.parse_args().memory_context_max_tokens == 4000
+
+
 @pytest.mark.parametrize("mode", ["trace_dir_is_a_file", "trace_dir_is_read_only"])
 def test_telemetry_write_failure_never_fails_the_question(
     tmp_path: Path,

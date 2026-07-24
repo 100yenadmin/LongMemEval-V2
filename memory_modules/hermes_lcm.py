@@ -156,6 +156,56 @@ def _state_semantic_quota_from_env() -> int:
     require(quota >= 0, f"HERMES_LCM_STATE_SEMANTIC_QUOTA must be >= 0, got {quota}")
     return quota
 
+
+def _diversity_cap_from_env() -> int:
+    """Optional W3b C1 per-trajectory cap at final arm composition."""
+    raw = os.environ.get("HERMES_LCM_DIVERSITY_CAP", "").strip()
+    if not raw:
+        return 0
+    try:
+        cap = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"HERMES_LCM_DIVERSITY_CAP must be an integer, got {raw!r}"
+        ) from exc
+    require(0 <= cap <= 24, f"HERMES_LCM_DIVERSITY_CAP must be between 0 and 24, got {cap}")
+    return cap
+
+
+def _adaptive_excerpt_from_env() -> bool:
+    """Optional W3b C2 query-anchored adaptive web excerpt window."""
+    raw = os.environ.get("HERMES_LCM_ADAPTIVE_EXCERPT", "").strip().casefold()
+    if not raw:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(
+        "HERMES_LCM_ADAPTIVE_EXCERPT must be boolean-like, "
+        f"got {raw!r}"
+    )
+
+
+def _sharp_token_budget_from_env() -> int:
+    """Optional W3b C3 sharp-compilation text budget (maximum 4k tokens)."""
+    raw = os.environ.get("HERMES_LCM_SHARP_TOKEN_BUDGET", "").strip()
+    if not raw:
+        return 0
+    try:
+        budget = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"HERMES_LCM_SHARP_TOKEN_BUDGET must be an integer, got {raw!r}"
+        ) from exc
+    require(
+        budget == 0 or 256 <= budget <= 4000,
+        "HERMES_LCM_SHARP_TOKEN_BUDGET must be 0 or between 256 and 4000, "
+        f"got {budget}",
+    )
+    return budget
+
+
 def _required_text(params: dict[str, object], key: str) -> str:
     value = params.get(key)
     require(isinstance(value, str) and value.strip(), f"hermes_lcm {key} must be a non-empty string")
@@ -324,6 +374,12 @@ class HermesLCMMemory(Memory):
         # State-level semantic pool-expansion override (env-var only, see the
         # _state_semantic_quota_from_env docstring); 0 reproduces current bytes.
         self._state_semantic_quota: int = _state_semantic_quota_from_env()
+        # W3b compact-delivery overrides. Every value is runtime-only and
+        # omitted from the product query call when off, preserving older
+        # product checkouts and frozen default bytes.
+        self._diversity_cap: int = _diversity_cap_from_env()
+        self._adaptive_excerpt: bool = _adaptive_excerpt_from_env()
+        self._sharp_token_budget: int = _sharp_token_budget_from_env()
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -558,6 +614,12 @@ class HermesLCMMemory(Memory):
                 "state_semantic_expansion_telemetry": telemetry.get(
                     "state_semantic_expansion"
                 ),
+                "diversity_cap": self._diversity_cap or None,
+                "diversity_cap_telemetry": telemetry.get("diversity_cap"),
+                "adaptive_excerpt": self._adaptive_excerpt or None,
+                "adaptive_excerpt_telemetry": telemetry.get("adaptive_excerpt"),
+                "sharp_token_budget": self._sharp_token_budget or None,
+                "sharp_compilation_telemetry": telemetry.get("sharp_compilation"),
                 "semantic_attempt": _call("last_semantic_attempt"),
                 "semantic_attempt_counters": _call("semantic_attempt_counters"),
                 "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
@@ -598,6 +660,9 @@ class HermesLCMMemory(Memory):
                 list(self._adjacency) if self._adjacency is not None else None
             ),
             "state_semantic_quota": self._state_semantic_quota or None,
+            "diversity_cap": self._diversity_cap or None,
+            "adaptive_excerpt": self._adaptive_excerpt or None,
+            "sharp_token_budget": self._sharp_token_budget or None,
             "telemetry_write_failures": self._telemetry_write_failures,
         }
 
@@ -682,6 +747,12 @@ class HermesLCMMemory(Memory):
             # on bench/h5-recall and later accept this kwarg -- omitted entirely
             # when unset/0 so older checkouts never see it.
             query_kwargs["state_semantic_quota"] = self._state_semantic_quota
+        if self._diversity_cap:
+            query_kwargs["diversity_cap"] = self._diversity_cap
+        if self._adaptive_excerpt:
+            query_kwargs["adaptive_excerpt"] = True
+        if self._sharp_token_budget:
+            query_kwargs["sharp_token_budget"] = self._sharp_token_budget
         hits = self._store.query(query, **query_kwargs)
         context: list[MemoryContextItem] = []
         for hit in hits:
