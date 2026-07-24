@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -65,6 +66,54 @@ BOOLEAN_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 MAX_CANDIDATES = 128
 MAX_RESULTS = 24
 MAX_TEXT_CHARS = 8_000
+
+PROVIDER_ENV_REQUIREMENTS: dict[str, str] = {
+    # Keep in sync with hermes_lcm_agentic.py's SEMANTIC_PROVIDER_ENV_VARS.
+    # This file is copied standalone into the codex sandbox (it cannot
+    # import the rest of the package there), so it carries its own copy of
+    # the provider -> required-credential mapping.
+    "voyage": "VOYAGE_API_KEY",
+}
+
+
+class SemanticConfigError(RuntimeError):
+    """Semantic retrieval is enabled but its required credential is absent
+    from the sandbox's environment. This is a config error, not a
+    transient provider blip: callers must fail loud, never silently
+    degrade to FTS-only retrieval for a missing key
+    (100yenadmin/hermes-lcm#147 P3 revision)."""
+
+
+def semantic_self_check(scope: dict[str, Any]) -> dict[str, Any]:
+    """Report semantic-retrieval availability without making any network
+    call. A `missing_key` status is the config-error class that must fail
+    loud (see SemanticConfigError); it is distinct from a
+    `fallback:<ExceptionType>` status discovered later at call time inside
+    semantic_source_ranks, which stays a counted-but-tolerated transient
+    provider failure."""
+    semantic_enabled = bool(scope.get("semantic_enabled", False))
+    provider_name = str(scope.get("semantic_provider", "")).strip() or None
+    required_env_var = (
+        PROVIDER_ENV_REQUIREMENTS.get(provider_name) if provider_name else None
+    )
+    env_var_present = bool(
+        required_env_var and os.environ.get(required_env_var, "").strip()
+    )
+    if not semantic_enabled:
+        status = "disabled"
+    elif required_env_var is None:
+        status = "unknown_provider_requirement"
+    elif env_var_present:
+        status = "available"
+    else:
+        status = "missing_key"
+    return {
+        "semantic_enabled": semantic_enabled,
+        "provider": provider_name,
+        "required_env_var": required_env_var,
+        "env_var_present": env_var_present,
+        "status": status,
+    }
 
 
 def require(condition: bool, message: str) -> None:
@@ -261,8 +310,18 @@ def semantic_source_ranks(
     source_ids: Sequence[int],
     scope: dict[str, Any],
 ) -> tuple[list[tuple[int, float]], str]:
-    if not bool(scope.get("semantic_enabled", False)):
+    self_check = semantic_self_check(scope)
+    if not self_check["semantic_enabled"]:
         return [], "disabled"
+    if self_check["status"] == "missing_key":
+        raise SemanticConfigError(
+            "semantic_enabled=True (provider="
+            f"{self_check['provider']!r}) but required credential "
+            f"{self_check['required_env_var']} is not set in this "
+            "sandbox's environment -- config error, not a transient "
+            "provider blip; refusing to silently degrade to FTS-only "
+            "retrieval."
+        )
     profile = connection.execute(
         """
         SELECT * FROM lcm_trajectory_embedding_profiles
@@ -642,6 +701,11 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         scope = load_scope(Path(args.scope).expanduser().resolve())
+        print(
+            "[hermes_search] semantic self-check: "
+            f"{json.dumps(semantic_self_check(scope))}",
+            file=sys.stderr,
+        )
         with connect_read_only(scope["canonical_store_path"]) as connection:
             resolve_scope_sources(connection, scope["trajectory_ids"])
             if args.command == "search":

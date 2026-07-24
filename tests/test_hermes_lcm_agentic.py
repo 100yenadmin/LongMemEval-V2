@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -212,6 +213,52 @@ print(json.dumps({
     return binary
 
 
+def _write_env_probe_codex(
+    tmp_path: Path,
+    *,
+    expected_env_var: str,
+    expected_value: str,
+) -> Path:
+    """A fake codex binary that asserts the sandbox subprocess actually
+    received `expected_env_var` -- exercises hermes_lcm_agentic.py's real
+    `_build_codex_env` -> subprocess.Popen(env=...) passthrough end to end,
+    without needing a live codex/Voyage call."""
+    binary = tmp_path / "fake-codex-env-probe"
+    binary.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+sandbox = Path(sys.argv[sys.argv.index("-C") + 1])
+actual = os.environ.get({expected_env_var!r})
+if actual != {expected_value!r}:
+    raise AssertionError(
+        f"expected sandbox env {expected_env_var!r}={expected_value!r}, "
+        f"got {{actual!r}}"
+    )
+(sandbox / "memory_module_output.json").write_text(
+    json.dumps({{
+        "memory_markdown": (
+            "## Support Analysis\\nenv probe ok.\\n\\n"
+            "## Relevant Procedure and Hint Notes\\nn/a."
+        ),
+        "trajectory_spans": [],
+    }}) + "\\n",
+    encoding="utf-8",
+)
+print(json.dumps({{
+    "type": "turn.completed",
+    "usage": {{"input_tokens": 1, "output_tokens": 1}},
+}}))
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
 def _config(tmp_path: Path) -> dict[str, object]:
     db_path, _store_dir = _create_store(tmp_path)
     questions_path = _write_questions(tmp_path)
@@ -399,3 +446,163 @@ def test_harness_and_run_eval_conformance_surfaces(tmp_path: Path):
         built["memory_params"]["canonical_store_path"]
         == config["memory_params"]["canonical_store_path"]
     )
+
+
+def _semantic_config(tmp_path: Path) -> dict[str, object]:
+    config = _config(tmp_path)
+    config["memory_params"]["retrieval_params"] = {
+        **config["memory_params"]["retrieval_params"],
+        "semantic_enabled": True,
+        "semantic_provider": "voyage",
+        "semantic_model": "voyage-3",
+    }
+    return config
+
+
+def test_semantic_credential_required_when_enabled_and_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """hermes-lcm#147 P3 revision: a missing Voyage key must fail loud at
+    construction time -- no silent FTS-only degradation for a config
+    error."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    config = _semantic_config(tmp_path)
+    with pytest.raises(RuntimeError, match="VOYAGE_API_KEY"):
+        build_memory(config)
+
+
+def test_semantic_credential_construction_succeeds_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-voyage-key-value")
+    config = _semantic_config(tmp_path)
+    memory = build_memory(config)
+    assert isinstance(memory, HermesLCMAgenticMemory)
+
+
+def test_semantic_credential_passthrough_to_codex_sandbox_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The codex sandbox subprocess must actually receive VOYAGE_API_KEY
+    when this process has it (env passthrough via _build_codex_env)."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-voyage-key-value")
+    config = _semantic_config(tmp_path)
+    probe_binary = _write_env_probe_codex(
+        tmp_path,
+        expected_env_var="VOYAGE_API_KEY",
+        expected_value="test-voyage-key-value",
+    )
+    config["memory_params"]["codex_params"]["binary"] = str(probe_binary)
+
+    memory = build_memory(config)
+    memory.insert({"id": "traj-in"})
+    memory.set_query_context(question_id="q1")
+    context = memory.query("Where is the alpha setting?")
+    rendered = "\n".join(item["value"] for item in context if item["type"] == "text")
+    assert "env probe ok" in rendered
+
+
+def test_search_cli_semantic_missing_key_fails_loud(tmp_path: Path):
+    """hermes_search.py's own startup self-check is a second, independent
+    layer of defense: even scoped directly (bypassing the harness-level
+    __init__ gate), a missing Voyage key must hard-fail the search command
+    rather than silently returning FTS-only hits."""
+    config = _config(tmp_path)
+    params = config["memory_params"]
+    scope_path = tmp_path / "hermes_scope_semantic.json"
+    retrieval_params = {
+        **params["retrieval_params"],
+        "semantic_enabled": True,
+        "semantic_provider": "voyage",
+        "semantic_model": "voyage-3",
+    }
+    scope_path.write_text(
+        json.dumps(
+            {
+                "canonical_store_path": params["canonical_store_path"],
+                "asset_root": params["asset_root"],
+                "product_root": params["product_root"],
+                "trajectory_ids": ["traj-in"],
+                **retrieval_params,
+            }
+        ),
+        encoding="utf-8",
+    )
+    script = Path(__file__).parents[1] / "memory_modules" / "hermes_search.py"
+    env_without_key = {
+        key: value for key, value in os.environ.items() if key != "VOYAGE_API_KEY"
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--scope",
+            str(scope_path),
+            "search",
+            "--query",
+            "alpha",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        env=env_without_key,
+    )
+    assert result.returncode != 0
+    assert "VOYAGE_API_KEY" in result.stderr
+    assert "hermes_search error" in result.stderr
+    # The self-check line always reports availability, even on failure.
+    assert "semantic self-check" in result.stderr
+    assert "missing_key" in result.stderr
+
+
+def test_search_cli_semantic_self_check_reports_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """When the key IS present, the self-check reports it -- and semantic
+    failures downstream of that point (e.g. a stub product root with no
+    real embedding provider) remain ordinary counted fallbacks, not a
+    hard failure."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-voyage-key-value")
+    config = _config(tmp_path)
+    params = config["memory_params"]
+    scope_path = tmp_path / "hermes_scope_semantic_ok.json"
+    retrieval_params = {
+        **params["retrieval_params"],
+        "semantic_enabled": True,
+        "semantic_provider": "voyage",
+        "semantic_model": "voyage-3",
+    }
+    scope_path.write_text(
+        json.dumps(
+            {
+                "canonical_store_path": params["canonical_store_path"],
+                "asset_root": params["asset_root"],
+                "product_root": params["product_root"],
+                "trajectory_ids": ["traj-in"],
+                **retrieval_params,
+            }
+        ),
+        encoding="utf-8",
+    )
+    script = Path(__file__).parents[1] / "memory_modules" / "hermes_search.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--scope",
+            str(scope_path),
+            "search",
+            "--query",
+            "alpha",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert "semantic self-check" in result.stderr
+    assert '"status": "available"' in result.stderr
+    # No real embedding profile exists in the stub store, so the call
+    # degrades to a counted, non-silent fallback -- not a hard failure.
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["semantic_status"] == "missing_profile"

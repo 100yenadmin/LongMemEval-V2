@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,30 @@ from .hermes_search import (
 from .memory import Memory, MemoryConfig, MemoryContextItem, register_memory, require
 
 
+SEMANTIC_PROVIDER_ENV_VARS: dict[str, str] = {
+    # Keep in sync with hermes_search.py's PROVIDER_ENV_REQUIREMENTS (that
+    # file is copied standalone into the codex sandbox and cannot import
+    # this module, so it carries its own copy of this mapping).
+    "voyage": "VOYAGE_API_KEY",
+}
+_SEMANTIC_STATUS_RE = re.compile(
+    r"semantic_status[^A-Za-z0-9]{1,6}([A-Za-z0-9_.:+-]+)"
+)
+
+
+def _count_semantic_statuses(stdout_text: str) -> dict[str, int]:
+    """Tally hermes_search.py `semantic_status` values observed anywhere in
+    this attempt's raw codex stdout (the JSONL event stream, which embeds
+    each shell tool call's captured output verbatim). Matches both the
+    plain-text CLI rendering (`semantic_status: fallback:VoyageError`) and
+    the `--json` form (`"semantic_status": "..."`), regardless of JSON
+    string-escaping in the enclosing codex event."""
+    counts: dict[str, int] = {}
+    for status_value in _SEMANTIC_STATUS_RE.findall(stdout_text):
+        counts[status_value] = counts.get(status_value, 0) + 1
+    return counts
+
+
 DEFAULT_PROMPT = (
     "You are acting as a memory retrieval module. "
     "Read INSTRUCTION.md and question.json in the current directory. "
@@ -71,6 +96,9 @@ Important rules:
 
 - Use the search CLI before returning your result. Try focused query rewrites
   when the first search is weak.
+- Prefer the CLI's top-ranked hits when selecting `trajectory_spans` unless
+  you have explicit evidence in the retrieved text that a lower-ranked hit
+  better answers the question.
 - Do not answer the benchmark question directly.
 - Put the most important evidence first and avoid redundant spans.
 - Use only trajectory and zero-based state ids printed by the CLI.
@@ -235,6 +263,21 @@ class HermesLCMAgenticMemory(Memory):
                 semantic_provider and semantic_model,
                 "hermes_lcm_agentic semantic provider/model must be set when enabled",
             )
+            required_env_var = SEMANTIC_PROVIDER_ENV_VARS.get(semantic_provider)
+            if required_env_var is not None:
+                require(
+                    bool(os.environ.get(required_env_var, "").strip()),
+                    (
+                        "hermes_lcm_agentic semantic_enabled=True (provider="
+                        f"{semantic_provider!r}) but the required credential "
+                        f"{required_env_var} is not set in this process's "
+                        "environment -- export it before launching (Voyage "
+                        "keychain recipe: ~/.claude/runbooks/"
+                        "hermes-benchmark-ops.md). A missing key must fail "
+                        "loud, not silently degrade the sandbox CLI to "
+                        "FTS-only retrieval."
+                    ),
+                )
         normalized_retrieval: dict[str, object] = {
             "candidate_limit": _bounded_int(
                 retrieval_params,
@@ -613,6 +656,19 @@ class HermesLCMAgenticMemory(Memory):
         command.append(self.codex_prompt)
         return command
 
+    def _build_codex_env(self) -> dict[str, str]:
+        """Explicit environment for the codex sandbox subprocess.
+
+        The sandbox must receive whatever credentials this process has
+        (e.g. VOYAGE_API_KEY for the semantic search arm -- see
+        __init__'s semantic-credential gate, which already required this
+        to be present when semantic_enabled=True). Building this
+        explicitly, rather than relying on subprocess.Popen's implicit
+        full-environment inheritance, keeps the passthrough intentional
+        and unit-testable.
+        """
+        return dict(os.environ)
+
     def _scope_payload(self, question_id: str) -> dict[str, object]:
         return {
             "schema": "hermes-lcm-agentic-question-scope-v1",
@@ -800,6 +856,7 @@ class HermesLCMAgenticMemory(Memory):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=(os.name == "posix"),
+                env=self._build_codex_env(),
             )
             while True:
                 elapsed_seconds = time.time() - started_at_ts
@@ -844,6 +901,11 @@ class HermesLCMAgenticMemory(Memory):
         events, usage = parse_codex_json_events(stdout_text)
         if events:
             save_json(events_path, events)
+        # Transient semantic-provider fallbacks (key present, call failed)
+        # are still allowed, but must be counted+reported, not silently
+        # absorbed -- tally every hermes_search.py `semantic_status` value
+        # seen in this attempt's raw codex stdout (hermes-lcm#147 P3 revision).
+        semantic_status_counts = _count_semantic_statuses(stdout_text)
         status = read_memory_output_status(
             output_path,
             require_evidence_gate=self.require_evidence_gate,
@@ -865,6 +927,7 @@ class HermesLCMAgenticMemory(Memory):
             "status_after": status.state,
             "status_after_detail": status.detail,
             "usage": usage,
+            "semantic_status_counts": semantic_status_counts,
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),
             "events_path": str(events_path) if events else None,
