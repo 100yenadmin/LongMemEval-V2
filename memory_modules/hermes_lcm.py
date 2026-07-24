@@ -134,6 +134,28 @@ def _adjacency_expansion_from_env() -> tuple[int, int] | None:
     return (radius, quota)
 
 
+def _state_semantic_quota_from_env() -> int:
+    """Optional state-level semantic pool-expansion override (a product's
+    ``TrajectoryStore.query(..., state_semantic_quota=Q)`` kwarg -- issue
+    hermes-lcm#142, Lane S / W3a: admit up to ``Q`` query-nearest per-STATE
+    semantic neighbours as an additive pool tail). Read from the environment
+    exactly like ``_lexical_floor_from_env`` -- never persisted into
+    memory_params/config, so a product checkout that predates the kwarg is simply
+    never passed it. Unset/empty/``0`` means "current bytes" (kwarg omitted from
+    the query() call entirely, not passed as 0 -- older products don't accept it).
+    """
+    raw = os.environ.get("HERMES_LCM_STATE_SEMANTIC_QUOTA", "").strip()
+    if not raw:
+        return 0
+    try:
+        quota = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"HERMES_LCM_STATE_SEMANTIC_QUOTA must be an integer, got {raw!r}"
+        ) from exc
+    require(quota >= 0, f"HERMES_LCM_STATE_SEMANTIC_QUOTA must be >= 0, got {quota}")
+    return quota
+
 def _required_text(params: dict[str, object], key: str) -> str:
     value = params.get(key)
     require(isinstance(value, str) and value.strip(), f"hermes_lcm {key} must be a non-empty string")
@@ -299,6 +321,9 @@ class HermesLCMMemory(Memory):
         # H5(b) adjacency pool-expansion override (env-var only, see the
         # _adjacency_expansion_from_env docstring); None reproduces current bytes.
         self._adjacency: tuple[int, int] | None = _adjacency_expansion_from_env()
+        # State-level semantic pool-expansion override (env-var only, see the
+        # _state_semantic_quota_from_env docstring); 0 reproduces current bytes.
+        self._state_semantic_quota: int = _state_semantic_quota_from_env()
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -529,6 +554,10 @@ class HermesLCMMemory(Memory):
                     list(self._adjacency) if self._adjacency is not None else None
                 ),
                 "adjacency_expansion_telemetry": telemetry.get("adjacency_expansion"),
+                "state_semantic_quota": self._state_semantic_quota or None,
+                "state_semantic_expansion_telemetry": telemetry.get(
+                    "state_semantic_expansion"
+                ),
                 "semantic_attempt": _call("last_semantic_attempt"),
                 "semantic_attempt_counters": _call("semantic_attempt_counters"),
                 "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
@@ -568,6 +597,7 @@ class HermesLCMMemory(Memory):
             "adjacency_expansion": (
                 list(self._adjacency) if self._adjacency is not None else None
             ),
+            "state_semantic_quota": self._state_semantic_quota or None,
             "telemetry_write_failures": self._telemetry_write_failures,
         }
 
@@ -647,6 +677,11 @@ class HermesLCMMemory(Memory):
             # entirely when unset so older checkouts never see them.
             query_kwargs["adjacency_radius"] = self._adjacency[0]
             query_kwargs["adjacency_quota"] = self._adjacency[1]
+        if self._state_semantic_quota:
+            # State-level semantic pool-expansion (hermes-lcm#142); only products
+            # on bench/h5-recall and later accept this kwarg -- omitted entirely
+            # when unset/0 so older checkouts never see it.
+            query_kwargs["state_semantic_quota"] = self._state_semantic_quota
         hits = self._store.query(query, **query_kwargs)
         context: list[MemoryContextItem] = []
         for hit in hits:
