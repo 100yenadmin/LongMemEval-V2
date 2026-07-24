@@ -605,6 +605,8 @@ def test_w3b_env_passthroughs_are_runtime_only_and_echoed(
     monkeypatch.setenv("HERMES_LCM_DIVERSITY_CAP", "2")
     monkeypatch.setenv("HERMES_LCM_ADAPTIVE_EXCERPT", "true")
     monkeypatch.setenv("HERMES_LCM_SHARP_TOKEN_BUDGET", "900")
+    monkeypatch.setenv("HERMES_LCM_ANTIBOILERPLATE", "true")
+    monkeypatch.setenv("HERMES_LCM_TITLE_BOOST", "1")
     _data_root, memory = _built_memory(tmp_path)
     captured: list[dict[str, object]] = []
     try:
@@ -620,15 +622,21 @@ def test_w3b_env_passthroughs_are_runtime_only_and_echoed(
         assert captured[-1]["diversity_cap"] == 2
         assert captured[-1]["adaptive_excerpt"] is True
         assert captured[-1]["sharp_token_budget"] == 900
+        assert captured[-1]["antiboilerplate"] is True
+        assert captured[-1]["title_boost"] is True
         assert not {
             "diversity_cap",
             "adaptive_excerpt",
             "sharp_token_budget",
+            "antiboilerplate",
+            "title_boost",
         } & set(memory.memory_params)
         summary = memory.run_summary()
         assert summary["diversity_cap"] == 2
         assert summary["adaptive_excerpt"] is True
         assert summary["sharp_token_budget"] == 900
+        assert summary["antiboilerplate"] is True
+        assert summary["title_boost"] is True
     finally:
         memory.close()
 
@@ -641,6 +649,8 @@ def test_w3b_env_passthroughs_are_omitted_when_unset(
         "HERMES_LCM_DIVERSITY_CAP",
         "HERMES_LCM_ADAPTIVE_EXCERPT",
         "HERMES_LCM_SHARP_TOKEN_BUDGET",
+        "HERMES_LCM_ANTIBOILERPLATE",
+        "HERMES_LCM_TITLE_BOOST",
     ):
         monkeypatch.delenv(name, raising=False)
     _data_root, memory = _built_memory(tmp_path)
@@ -658,6 +668,8 @@ def test_w3b_env_passthroughs_are_omitted_when_unset(
         assert "diversity_cap" not in captured[-1]
         assert "adaptive_excerpt" not in captured[-1]
         assert "sharp_token_budget" not in captured[-1]
+        assert "antiboilerplate" not in captured[-1]
+        assert "title_boost" not in captured[-1]
     finally:
         memory.close()
 

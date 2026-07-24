@@ -206,6 +206,36 @@ def _sharp_token_budget_from_env() -> int:
     return budget
 
 
+def _antiboilerplate_from_env() -> bool:
+    """Optional W3b Knob G anti-boilerplate MMR re-weighting (default-off)."""
+    raw = os.environ.get("HERMES_LCM_ANTIBOILERPLATE", "").strip().casefold()
+    if not raw:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(
+        "HERMES_LCM_ANTIBOILERPLATE must be boolean-like, "
+        f"got {raw!r}"
+    )
+
+
+def _title_boost_from_env() -> bool:
+    """Optional W3b Knob H exact-title n-gram lexical boost (default-off)."""
+    raw = os.environ.get("HERMES_LCM_TITLE_BOOST", "").strip().casefold()
+    if not raw:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(
+        "HERMES_LCM_TITLE_BOOST must be boolean-like, "
+        f"got {raw!r}"
+    )
+
+
 def _required_text(params: dict[str, object], key: str) -> str:
     value = params.get(key)
     require(isinstance(value, str) and value.strip(), f"hermes_lcm {key} must be a non-empty string")
@@ -380,6 +410,10 @@ class HermesLCMMemory(Memory):
         self._diversity_cap: int = _diversity_cap_from_env()
         self._adaptive_excerpt: bool = _adaptive_excerpt_from_env()
         self._sharp_token_budget: int = _sharp_token_budget_from_env()
+        # W3b iteration-4 retrieval knobs (env-var only, default-off); each is
+        # omitted from the product query call unless enabled.
+        self._antiboilerplate: bool = _antiboilerplate_from_env()
+        self._title_boost: bool = _title_boost_from_env()
 
     @classmethod
     def reconcile_loaded_memory_config(
@@ -620,6 +654,9 @@ class HermesLCMMemory(Memory):
                 "adaptive_excerpt_telemetry": telemetry.get("adaptive_excerpt"),
                 "sharp_token_budget": self._sharp_token_budget or None,
                 "sharp_compilation_telemetry": telemetry.get("sharp_compilation"),
+                "antiboilerplate": self._antiboilerplate or None,
+                "title_boost": self._title_boost or None,
+                "title_boost_telemetry": telemetry.get("title_boost"),
                 "semantic_attempt": _call("last_semantic_attempt"),
                 "semantic_attempt_counters": _call("semantic_attempt_counters"),
                 "source_candidate_ranks": telemetry.get("source_candidate_ranks", []),
@@ -663,6 +700,8 @@ class HermesLCMMemory(Memory):
             "diversity_cap": self._diversity_cap or None,
             "adaptive_excerpt": self._adaptive_excerpt or None,
             "sharp_token_budget": self._sharp_token_budget or None,
+            "antiboilerplate": self._antiboilerplate or None,
+            "title_boost": self._title_boost or None,
             "telemetry_write_failures": self._telemetry_write_failures,
         }
 
@@ -753,6 +792,15 @@ class HermesLCMMemory(Memory):
             query_kwargs["adaptive_excerpt"] = True
         if self._sharp_token_budget:
             query_kwargs["sharp_token_budget"] = self._sharp_token_budget
+        if self._antiboilerplate:
+            # W3b Knob G (hermes-lcm#143); only products on
+            # bench/w3b-compact-delivery iteration-4 and later accept this kwarg
+            # -- omitted entirely when off so older checkouts never see it.
+            query_kwargs["antiboilerplate"] = True
+        if self._title_boost:
+            # W3b Knob H (hermes-lcm#143); same omitted-when-off discipline so a
+            # pre-iteration-4 product checkout's query() never sees it.
+            query_kwargs["title_boost"] = True
         hits = self._store.query(query, **query_kwargs)
         context: list[MemoryContextItem] = []
         for hit in hits:
